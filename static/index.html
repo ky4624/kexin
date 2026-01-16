@@ -82,33 +82,46 @@
             msgInput.value = '';
             fileInput.value = '';
 
-            // 构造表单数据：文字+文件
-            const formData = new FormData();
-            formData.append('content', content);
-            for (let i = 0; i < files.length; i++) {
-                formData.append('files', files[i]);
-            }
-
             // 调用后端接口
             try {
-                const res = await fetch(content ? '/chat' : '/save_all', {
-                    method: 'POST',
-                    body: content && files.length === 0 ? JSON.stringify({message: content}) : formData,
-                    headers: content && files.length === 0 ? {'Content-Type': 'application/json'} : {}
-                });
-                const data = await res.json();
-                // 添加AI回复
-                addMsg('ai', data.ai_reply);
-                // 显示关键记忆标签
-                if (data.your_key_memory && Object.keys(data.your_key_memory).length > 0) {
-                    let memoryStr = "🧠 你的长期记忆：";
-                    for (let [k, v] of Object.entries(data.your_key_memory)) {
-                        memoryStr += `<span class="memory-tag">${k}：${v}</span>`;
+                let res, data;
+                // 如果有文件上传，无论是否有内容，都调用/save_all接口
+                if (files.length > 0) {
+                    // 构造表单数据：文字+文件
+                    const formData = new FormData();
+                    formData.append('content', content);
+                    for (let i = 0; i < files.length; i++) {
+                        formData.append('files', files[i]);
                     }
-                    addMsg('ai', memoryStr);
+                    res = await fetch('/save_all', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    data = await res.json();
+                    // /save_all接口返回的是msg字段
+                    addMsg('ai', data.msg);
+                } else {
+                    // 只有文字内容时，调用/chat接口
+                    res = await fetch('/chat', {
+                        method: 'POST',
+                        body: JSON.stringify({message: content}),
+                        headers: {'Content-Type': 'application/json'}
+                    });
+                    data = await res.json();
+                    // /chat接口返回的是ai_reply字段
+                    addMsg('ai', data.ai_reply);
+                    // 显示关键记忆标签
+                    if (data.your_key_memory && Object.keys(data.your_key_memory).length > 0) {
+                        let memoryStr = "🧠 你的长期记忆：";
+                        for (let [k, v] of Object.entries(data.your_key_memory)) {
+                            memoryStr += `<span class="memory-tag">${k}：${v}</span>`;
+                        }
+                        addMsg('ai', memoryStr);
+                    }
                 }
             } catch (e) {
                 addMsg('ai', '❌ 网络错误，请重试！');
+                console.error('网络请求错误:', e);
             }
         }
 

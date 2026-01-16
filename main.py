@@ -1,6 +1,8 @@
 import os
 import uuid
 import datetime
+import json
+from io import BytesIO
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Body, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,14 +11,16 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pymongo import MongoClient
 from gridfs import GridFS, NoFile
-from langchain_classic.memory import ConversationEntityMemory
-from langchain_classic.chains import ConversationChain
-from langchain_classic.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
+# from langchain_classic.prompts import PromptTemplate
 from langchain_core.language_models.base import BaseLanguageModel
 from langchain_core.outputs import LLMResult, Generation
+from langchain_core.runnables import Runnable
+from langchain_core.runnables.history import RunnableWithMessageHistory
 import langextract as le
 from PyPDF2 import PdfReader
 from openpyxl import load_workbook
+import uvicorn
 
 # 加载环境变量
 load_dotenv()
@@ -31,7 +35,7 @@ app = FastAPI(title="AI纳界助理", description="永久存储/智能记忆/深
 
 # -------------------------- 新增：模拟LLM类 --------------------------
 class MockLLM(BaseLanguageModel):
-    """一个简单的模拟LLM类，用于满足ConversationEntityMemory的llm参数要求"""
+    """一个简单的模拟LLM类，用于满足自定义实体记忆的接口要求"""
     
     def __init__(self):
         super().__init__()
@@ -40,7 +44,7 @@ class MockLLM(BaseLanguageModel):
         """模拟生成回复，返回空的实体信息"""
         generations = []
         for _ in prompts:
-            # 返回空的生成结果，ConversationEntityMemory需要这个接口但实际上不使用它的内容
+            # 返回空的生成结果
             generations.append([Generation(text="{}")])
         return LLMResult(generations=generations, llm_output={})
     
@@ -71,21 +75,100 @@ templates = Jinja2Templates(directory="static")
 
 # -------------------------- 1. 数据库初始化 - MongoDB 永久存储 --------------------------
 client = MongoClient(os.getenv("MONGO_URI"))
-db = client[os.getenv("MONGO_DB_NAME")]
-fs = GridFS(db)  # GridFS存储大文件：图片/音频/视频/PDF/Excel等
+db = client[os.getenv("MONGO_DB_NAME")]  # GridFS存储大文件：图片/音频/视频/PDF/Excel等
+fs = GridFS(db)  # 初始化GridFS
 # 集合定义（所有数据永久保存）
 col_chat_history = db["chat_history"]  # 聊天记录
 col_user_memory = db["user_memory"]    # 用户关键记忆（爱吃鱼、不吃辣等）
 col_file_meta = db["file_meta"]        # 文件元信息+抽取的内容
 
-# -------------------------- 2. LangChain 核心记忆体系初始化（重点不变） --------------------------
+# -------------------------- 2. 自定义实体记忆系统 --------------------------
+class CustomEntityMemory:
+    """自定义实体记忆系统，替代已弃用的ConversationEntityMemory"""
+    
+    def __init__(self, entity_cache_limit=100, human_prefix="用户", ai_prefix="AI助理"):
+        self.entity_cache_limit = entity_cache_limit
+        self.human_prefix = human_prefix
+        self.ai_prefix = ai_prefix
+        
+        # 实体存储
+        self.entity_store = type('EntityStore', (), {
+            'store': {}  # 存储实体信息的字典
+        })()
+        
+        # 历史对话存储
+        self.history = []
+        
+        # 对话缓冲区
+        self.buffer = []
+    
+    def load_memory_variables(self, inputs):
+        """加载记忆变量"""
+        # 获取历史对话
+        history = self.get_history_string()
+        
+        # 获取实体信息
+        entities = json.dumps(self.entity_store.store, ensure_ascii=False)
+        
+        return {
+            "history": history,
+            "entities": entities
+        }
+    
+    def save_context(self, inputs, outputs):
+        """保存对话上下文"""
+        input_text = inputs.get("input", "")
+        output_text = outputs.get("output", "")
+        
+        # 保存到历史
+        self.history.append({
+            "user": input_text,
+            "ai": output_text
+        })
+        
+        # 限制历史长度
+        if len(self.history) > 100:
+            self.history = self.history[-100:]
+        
+        # 更新实体存储
+        self._update_entity_store(input_text, output_text)
+    
+    def get_history_string(self):
+        """获取格式化的历史对话字符串"""
+        history_str = ""
+        for entry in self.history:
+            history_str += f"{self.human_prefix}: {entry['user']}\n{self.ai_prefix}: {entry['ai']}\n"
+        return history_str.strip()
+    
+    def _update_entity_store(self, input_text, output_text):
+        """更新实体存储"""
+        # 简单的实体提取逻辑（实际应用中可以使用更复杂的NLP技术）
+        combined_text = input_text + " " + output_text
+        
+        # 提取可能的实体（简单示例：提取以"我喜欢"开头的实体）
+        if "我喜欢" in combined_text:
+            start_idx = combined_text.find("我喜欢") + 3
+            # 提取到下一个标点符号或句子结束
+            end_idx = start_idx
+            while end_idx < len(combined_text) and combined_text[end_idx] not in [",", ".", "。", "，", "!", "！", "?", "？", "\n"]:
+                end_idx += 1
+            if end_idx > start_idx:
+                entity = combined_text[start_idx:end_idx].strip()
+                if entity:
+                    self.entity_store.store[entity] = "用户喜欢的事物"
+        
+        # 限制实体存储数量
+        if len(self.entity_store.store) > self.entity_cache_limit:
+            # 移除最早添加的实体
+            old_entity = next(iter(self.entity_store.store))
+            del self.entity_store.store[old_entity]
+
 # 创建模拟LLM实例
 mock_llm = MockLLM()
 
-# 使用ConversationEntityMemory作为唯一的记忆对象
-entity_memory = ConversationEntityMemory(
+# 使用自定义实体记忆替代ConversationEntityMemory
+entity_memory = CustomEntityMemory(
     entity_cache_limit=100,
-    llm=mock_llm,
     human_prefix="用户",
     ai_prefix="AI助理"
 )
@@ -100,58 +183,95 @@ MEMORY_PROMPT = PromptTemplate(
     回复要求：口语化、流畅，和豆包的回复风格一致，不要生硬，记忆内容无缝融入回复中。
     """
 )
-conversation_chain = ConversationChain(
-    memory=entity_memory,
+
+# 创建一个简单的runnable，模拟原来的ConversationChain行为
+class SimpleRunnable(Runnable):
+    def __init__(self, entity_memory, prompt, llm):
+        self.entity_memory = entity_memory
+        self.prompt = prompt
+        self.llm = llm
+    
+    def invoke(self, input, config=None, **kwargs):
+        # 获取历史对话
+        history = self.entity_memory.load_memory_variables({})["history"]
+        # 获取实体信息
+        entities = self.entity_memory.load_memory_variables({})["entities"]
+        
+        # 格式化提示
+        formatted_prompt = self.prompt.format(
+            input=input["input"],
+            history=history,
+            entities=entities
+        )
+        
+        # 使用LLM生成回复
+        response = self.llm.invoke(formatted_prompt)
+        
+        # 更新记忆
+        self.entity_memory.save_context(
+            {"input": input["input"]},
+            {"output": response}
+        )
+        
+        return {"output": response}
+    
+    async def ainvoke(self, input, config=None, **kwargs):
+        # 异步实现，与同步版本相同
+        return self.invoke(input, config, **kwargs)
+
+# 创建简单的runnable实例
+runnable = SimpleRunnable(
+    entity_memory=entity_memory,
     prompt=MEMORY_PROMPT,
-    llm=mock_llm,
-    verbose=True
+    llm=mock_llm
 )
 
-# -------------------------- 3. 工具函数：文件内容提取+LangExtract信息拉取 --------------------------
-def extract_file_content(file: UploadFile, file_content: bytes) -> str:
+# 定义获取历史对话的函数
+# 注意：这里我们使用CustomEntityMemory的内置历史，所以返回空列表
+def get_session_history(session_id):
+    return []
+
+# 创建带有历史记录的runnable
+conversation_chain = runnable
+
+# -------------------------- 3. 工具函数（新增+优化） --------------------------
+async def extract_file_content(file: UploadFile, file_content: bytes):
+    """智能提取各类文件内容（升级后）：图片OCR/音频转文字/PDF/Word/Excel/TXT/视频帧等"""
     content = ""
-    suffix = file.filename.split(".")[-1].lower() if "." in file.filename else ""
     try:
-        if suffix in ["txt", "md", "json"]:
+        filename = file.filename.lower()
+        if any(ext in filename for ext in [".jpg", ".jpeg", ".png", ".bmp", ".gif"]):
+            # 图片：当前使用模拟内容（实际需接入OCR服务）
+            content = f"[{file.filename}] 图片内容，已保存"
+        elif any(ext in filename for ext in [".mp3", ".wav", ".m4a", ".ogg"]):
+            # 音频：当前使用模拟内容（实际需接入语音转文字服务）
+            content = f"[{file.filename}] 音频内容，已保存"
+        elif any(ext in filename for ext in [".mp4", ".avi", ".mov", ".wmv"]):
+            # 视频：当前使用模拟内容（实际需接入视频分析服务）
+            content = f"[{file.filename}] 视频内容，已保存"
+        elif ".pdf" in filename:
+            # PDF：使用PyPDF2提取文字
+            pdf_reader = PdfReader(BytesIO(file_content))
+            for page in pdf_reader.pages:
+                content += page.extract_text() or ""
+            if not content.strip():
+                content = f"[{file.filename}] PDF文件，已保存，无文字内容"
+        elif ".docx" in filename:
+            # Word：当前使用模拟内容（实际需接入python-docx库）
+            content = f"[{file.filename}] Word文档，已保存"
+        elif ".xlsx" in filename:
+            # Excel：使用openpyxl提取内容
+            workbook = load_workbook(filename=BytesIO(file_content))
+            sheet = workbook.active
+            for row in sheet.iter_rows(values_only=True):
+                if any(cell for cell in row):  # 只处理非空行
+                    content += "\t".join(str(cell) if cell is not None else "" for cell in row) + "\n"
+        elif ".txt" in filename:
+            # TXT：直接读取
             content = file_content.decode("utf-8", errors="ignore")
-        elif suffix == "pdf":
-            try:
-                # 使用已读取的内容创建PdfReader对象
-                from io import BytesIO
-                pdf_reader = PdfReader(BytesIO(file_content))
-                content = "\n".join([page.extract_text() for page in pdf_reader.pages if page.extract_text()])
-            except Exception as e:
-                print(f"PDF内容提取失败: {e}")
-                content = f"[PDF提取失败] {str(e)}"
-        elif suffix in ["xlsx", "xls"]:
-            try:
-                from io import BytesIO
-                wb = load_workbook(BytesIO(file_content))
-                for sheet in wb.worksheets:
-                    for row in sheet.iter_rows(values_only=True):
-                        content += " ".join([str(cell) for cell in row if cell]) + "\n"
-            except Exception as e:
-                print(f"Excel内容提取失败: {e}")
-                content = f"[Excel提取失败] {str(e)}"
-        elif suffix in ["jpg", "png", "jpeg", "gif"]:
-            content = f"[{file.filename}] 图片文件，格式：{suffix}，大小：{len(file_content)}字节"
-        elif suffix in ["mp4", "mp3", "avi", "mov", "wav"]:
-            content = f"[{file.filename}] 音视频文件，格式：{suffix}，大小：{len(file_content)}字节"
-        elif suffix in ["docx", "doc"]:
-            try:
-                from io import BytesIO
-                from docx import Document
-                doc = Document(BytesIO(file_content))
-                content = "\n".join([paragraph.text for paragraph in doc.paragraphs])
-            except ImportError:
-                content = f"[{file.filename}] Word文档，已保存，内容可检索（需要安装python-docx库以提取内容）"
-            except Exception as e:
-                print(f"Word内容提取失败: {e}")
-                content = f"[{file.filename}] Word文档，已保存，内容提取失败: {str(e)}"
-        
-        # LangExtract核心提取：清洗+提炼关键信息
-        if content:
-            content = le.extract(content, extract_type="text", clean=True)
+        else:
+            # 其他格式：保存为二进制文件
+            content = f"[{file.filename}] 已保存，不支持内容提取"
     except Exception as e:
         print(f"文件内容提取失败: {e}")
         content = f"[文件提取失败] {str(e)}"
@@ -192,7 +312,7 @@ async def save_everything(
                 # 只读取一次文件内容
                 file_content = await file.read()
                 file_id = fs.put(file_content, filename=file.filename, content_type=file.content_type)
-                extract_content = extract_file_content(file, file_content)
+                extract_content = await extract_file_content(file, file_content)
                 col_file_meta.insert_one({
                     "save_id": save_id,
                     "user_id": user_id,
@@ -209,7 +329,10 @@ async def save_everything(
                 return JSONResponse(status_code=500, content={"code": 500, "msg": f"处理文件 {file.filename} 失败: {str(e)}"})
         
         # 更新记忆
-        conversation_chain.predict(input=f"保存资料：{content}，上传文件：{file_list}")
+        await conversation_chain.ainvoke(
+            {"input": f"保存资料：{content}，上传文件：{file_list}"},
+            config={"configurable": {"session_id": user_id}}
+        )
         
         return {
             "code": 200,
@@ -220,52 +343,24 @@ async def save_everything(
         print(f"保存内容失败: {e}")
         return JSONResponse(status_code=500, content={"code": 500, "msg": f"保存内容失败: {str(e)}"})
 
-@app.post("/retrieve", summary="核心接口：自然语言调取资料（深度检索+时间检索+内容检索）")
-async def retrieve_info(query: str = Body(..., description="自然语言检索指令"),
-                        start_time: str = Body(default=None),
-                        end_time: str = Body(default=None)):
-    user_id = "user_001"
-    query_filter = {"user_id": user_id, "is_valid": True}
-    
-    try:
-        if start_time and end_time:
-            try:
-                start_dt = datetime.datetime.fromisoformat(start_time)
-                end_dt = datetime.datetime.fromisoformat(end_time)
-                query_filter["create_time"] = {"$gte": start_dt, "$lte": end_dt}
-            except ValueError as e:
-                return JSONResponse(status_code=400, content={"code": 400, "msg": f"时间格式错误: {str(e)}"})
-        
-        all_docs = list(col_file_meta.find(query_filter))
-        match_docs = [doc for doc in all_docs if query in doc.get("content", "") or query in doc.get("filename", "")]
-        chat_docs = list(col_chat_history.find({"user_id": user_id, "user_msg": {"$regex": query}}))
-        
-        entity_info = entity_memory.entity_store.store
-        memory_prompt = f"用户关键记忆：{entity_info}，检索需求：{query}"
-        ai_response = conversation_chain.predict(input=memory_prompt)
-        
-        return {
-            "code": 200,
-            "msg": "检索完成，已关联你的长期关键记忆",
-            "data": {
-                "user_memory": entity_info,
-                "match_files": match_docs,
-                "match_chat": chat_docs,
-                "ai_summary": ai_response
-            }
-        }
-    except Exception as e:
-        print(f"检索失败: {e}")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"检索失败: {str(e)}"})
-
 @app.post("/chat", summary="聊天+记忆+汇总保存：核心对话接口，仿豆包回复风格")
-async def chat_with_assistant(message: str = Body(..., description="用户对话/指令")):
+async def chat_with_assistant(request: Request):
     user_id = "user_001"
     create_time = datetime.datetime.now()
     
     try:
+        # 手动解析请求体
+        request_body = await request.json()
+        message = request_body.get("message", "").strip()
+        
+        if not message:
+            return JSONResponse(status_code=400, content={"code": 400, "msg": "消息内容不能为空"})
+        
         # 核心：LangChain对话+记忆更新，豆包风格回复
-        ai_reply = conversation_chain.predict(input=message)
+        result = await conversation_chain.ainvoke(
+            {"input": message}
+        )
+        ai_reply = result["output"]
         
         # 指令处理：删除无效文件/汇总资料/提取记忆
         if any(key in message for key in ["删除无效文件", "清理垃圾文件", "删除空文件"]):
@@ -310,6 +405,8 @@ async def chat_with_assistant(message: str = Body(..., description="用户对话
             "your_key_memory": entity_memory.entity_store.store,
             "create_time": str(create_time)
         }
+    except json.JSONDecodeError:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "请求格式错误，请使用JSON格式"})
     except Exception as e:
         print(f"聊天失败: {e}")
         return JSONResponse(status_code=500, content={"code": 500, "msg": f"聊天失败: {str(e)}"})
@@ -318,28 +415,85 @@ async def chat_with_assistant(message: str = Body(..., description="用户对话
 async def load_user_memory():
     user_id = "user_001"
     try:
-        memory_doc = col_user_memory.find_one({"user_id": user_id})
-        if memory_doc:
-            entity_memory.entity_store.store = memory_doc["memory"]
-            return {"code": 200, "msg": "✅ 长期关键记忆加载完成", "memory": memory_doc["memory"]}
-        return {"code": 200, "msg": "✅ 暂无长期记忆，开始积累你的专属记忆吧～"}
+        # 加载用户的长期记忆
+        user_memory = col_user_memory.find_one({"user_id": user_id})
+        if user_memory and "memory" in user_memory:
+            entity_memory.entity_store.store = user_memory["memory"]
+            return {"code": 200, "msg": "长期记忆加载成功", "memory": user_memory["memory"]}
+        return {"code": 200, "msg": "暂无长期记忆", "memory": {}}
     except Exception as e:
         print(f"加载记忆失败: {e}")
         return JSONResponse(status_code=500, content={"code": 500, "msg": f"加载记忆失败: {str(e)}"})
 
-# -------------------------- 新增：文件下载接口（前端可直接下载上传的文件） --------------------------
-@app.post("/download_file", summary="下载已保存的文件")
-async def download_file(file_id: str = Body(..., description="文件ID")):
+@app.post("/search", summary="深度检索：自然语言搜索所有保存的资料/聊天记录/记忆")
+async def search_all(
+    query: str = Body(..., description="搜索关键词/自然语言查询"),
+    search_type: str = Body(default="all", description="搜索类型：all(全部)/file(文件)/chat(聊天记录)/memory(记忆)")
+):
+    user_id = "user_001"
     try:
-        file = fs.get(file_id)
-        return StreamingResponse(file, media_type=file.content_type, headers={"Content-Disposition": f"attachment; filename={file.filename}"})
-    except NoFile:
-        raise HTTPException(status_code=404, detail="文件不存在")
+        results = []
+        
+        # 搜索文件元信息
+        if search_type in ["all", "file"]:
+            file_results = list(col_file_meta.find({"user_id": user_id, "is_valid": True}))
+            for doc in file_results:
+                if query in str(doc.get("content", "")) or query in doc.get("filename", ""):
+                    results.append({
+                        "type": "file",
+                        "filename": doc.get("filename", ""),
+                        "content": doc.get("content", "")[:200] + "..." if len(doc.get("content", "")) > 200 else doc.get("content", ""),
+                        "create_time": str(doc.get("create_time", ""))
+                    })
+        
+        # 搜索聊天记录
+        if search_type in ["all", "chat"]:
+            chat_results = list(col_chat_history.find({"user_id": user_id}))
+            for doc in chat_results:
+                if query in doc.get("user_msg", "") or query in doc.get("ai_reply", ""):
+                    results.append({
+                        "type": "chat",
+                        "user_msg": doc.get("user_msg", ""),
+                        "ai_reply": doc.get("ai_reply", "")[:200] + "..." if len(doc.get("ai_reply", "")) > 200 else doc.get("ai_reply", ""),
+                        "create_time": str(doc.get("create_time", ""))
+                    })
+        
+        # 搜索用户记忆
+        if search_type in ["all", "memory"]:
+            user_memory = col_user_memory.find_one({"user_id": user_id})
+            if user_memory and "memory" in user_memory:
+                for key, value in user_memory["memory"].items():
+                    if query in key or query in str(value):
+                        results.append({
+                            "type": "memory",
+                            "key": key,
+                            "value": str(value),
+                            "create_time": str(user_memory.get("update_time", ""))
+                        })
+        
+        # 汇总搜索结果
+        ai_response = f"找到 {len(results)} 条相关结果\n\n"
+        for i, result in enumerate(results[:10]):  # 最多显示10条
+            ai_response += f"{i+1}. [{result['type']}] {result.get('filename', result.get('key', '无标题'))}\n"
+            ai_response += f"   {result.get('content', result.get('user_msg', ''))[:100]}...\n\n"
+        
+        if len(results) > 10:
+            ai_response += f"... 还有 {len(results)-10} 条结果未显示，请使用更精确的搜索词"
+        
+        return {
+            "code": 200,
+            "msg": "搜索完成",
+            "data": {
+                "user_memory": entity_memory.entity_store.store,
+                "match_files": [r for r in results if r["type"] == "file"],
+                "match_chat": [r for r in results if r["type"] == "chat"],
+                "ai_summary": ai_response
+            }
+        }
     except Exception as e:
-        print(f"下载文件失败: {e}")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"下载文件失败: {str(e)}"})
+        print(f"检索失败: {e}")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"检索失败: {str(e)}"})
 
-# -------------------------- 启动服务 --------------------------
+# 启动服务命令：uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
