@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI纳界助理 - 仿豆包对话版</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">
+        <!-- 左侧：记忆/知识库导航 -->
+        <div class="left-sidebar">
+            <div class="title">📚 我的记忆与知识库</div>
+            <div class="menu-item active" onclick="loadMemory()">🔍 加载我的长期记忆</div>
+            <div class="menu-item" onclick="sendMsg('提取我的关键记忆')">🧠 查看我的关键记忆</div>
+            <div class="menu-item" onclick="sendMsg('汇总我的所有资料')">📖 汇总所有资料</div>
+            <div class="menu-item" onclick="sendMsg('删除无效文件')">🗑️ 清理无效文件</div>
+            <div class="menu-item" onclick="sendMsg('查找所有关于美食的资料')">🍲 美食相关资料</div>
+        </div>
+
+        <!-- 中间：核心对话区域（仿豆包） -->
+        <div class="chat-area">
+            <div class="chat-header">AI纳界助理 - 永久记忆 | 全格式知识库 | 自然语言操控</div>
+            <div class="chat-content" id="chat-content">
+                <!-- 欢迎语 -->
+                <div class="message ai-message">
+                    <div class="avatar">AI</div>
+                    <div class="content">
+                        你好～我是你的专属纳界助理，和豆包一样好用哦！<br>
+                        ✅ 可以发送文字/日记/资料，我会永久保存<br>
+                        ✅ 可以上传图片/PDF/Excel/音视频，自动解析内容<br>
+                        ✅ 我会记住你的所有偏好（比如爱吃鱼、不吃辣）<br>
+                        ✅ 所有操作都可以用自然语言指令完成～
+                    </div>
+                </div>
+            </div>
+
+            <!-- 底部：输入框（豆包同款） -->
+            <div class="input-area">
+                <label for="file-input" class="file-btn"><i class="fas fa-paperclip"></i></label>
+                <input type="file" id="file-input" multiple accept="*">
+                <textarea id="msg-input" placeholder="输入你的问题/指令/资料，支持自然语言操控，比如：我爱吃鱼不吃辣、保存这份日记、查找上周的PDF..." spellcheck="false"></textarea>
+                <button id="send-btn" onclick="sendMsg()">发送</button>
+            </div>
+        </div>
+
+        <!-- 右侧：快捷指令 -->
+        <div class="right-sidebar">
+            <div class="title">⚡ 快捷指令</div>
+            <div class="shortcut" onclick="sendMsg('今天适合吃什么？')">今天吃什么？</div>
+            <div class="shortcut" onclick="sendMsg('保存：我爱吃清蒸鱼，不吃辣和香菜')">添加饮食偏好</div>
+            <div class="shortcut" onclick="sendMsg('查找我上传的所有PDF文件')">查找PDF文件</div>
+            <div class="shortcut" onclick="sendMsg('帮我整理今天的日记')">整理日记</div>
+        </div>
+    </div>
+
+    <script>
+        // 加载长期记忆（页面加载自动执行）
+        window.onload = async () => {
+            await loadMemory();
+        };
+
+        // 加载记忆接口
+        async function loadMemory() {
+            const res = await fetch('/load_memory', { method: 'POST', headers: {'Content-Type': 'application/json'}});
+            const data = await res.json();
+            addMsg('ai', data.msg);
+        }
+
+        // 发送消息核心函数
+        async function sendMsg(customMsg = '') {
+            const msgInput = document.getElementById('msg-input');
+            const content = customMsg || msgInput.value.trim();
+            const fileInput = document.getElementById('file-input');
+            const files = fileInput.files;
+
+            if (!content && files.length === 0) return;
+
+            // 添加用户消息到页面
+            addMsg('user', content);
+            msgInput.value = '';
+            fileInput.value = '';
+
+            // 构造表单数据：文字+文件
+            const formData = new FormData();
+            formData.append('content', content);
+            for (let i = 0; i < files.length; i++) {
+                formData.append('files', files[i]);
+            }
+
+            // 调用后端接口
+            try {
+                const res = await fetch(content ? '/chat' : '/save_all', {
+                    method: 'POST',
+                    body: content && files.length === 0 ? JSON.stringify({message: content}) : formData,
+                    headers: content && files.length === 0 ? {'Content-Type': 'application/json'} : {}
+                });
+                const data = await res.json();
+                // 添加AI回复
+                addMsg('ai', data.ai_reply);
+                // 显示关键记忆标签
+                if (data.your_key_memory && Object.keys(data.your_key_memory).length > 0) {
+                    let memoryStr = "🧠 你的长期记忆：";
+                    for (let [k, v] of Object.entries(data.your_key_memory)) {
+                        memoryStr += `<span class="memory-tag">${k}：${v}</span>`;
+                    }
+                    addMsg('ai', memoryStr);
+                }
+            } catch (e) {
+                addMsg('ai', '❌ 网络错误，请重试！');
+            }
+        }
+
+        // 添加消息到对话区
+        function addMsg(type, content) {
+            const chatContent = document.getElementById('chat-content');
+            const msgDiv = document.createElement('div');
+            msgDiv.className = `message ${type}-message`;
+            msgDiv.innerHTML = `
+                <div class="avatar">${type === 'user' ? '你' : 'AI'}</div>
+                <div class="content">${content.replace(/\n/g, '<br>')}</div>
+            `;
+            chatContent.appendChild(msgDiv);
+            // 滚动到底部
+            chatContent.scrollTop = chatContent.scrollHeight;
+        }
+
+        // 回车发送消息
+        document.getElementById('msg-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMsg();
+            }
+        });
+    </script>
+</body>
+</html>
