@@ -17,6 +17,7 @@
             <div class="menu-item" onclick="sendMsg('汇总我的所有资料')">📖 汇总所有资料</div>
             <div class="menu-item" onclick="sendMsg('删除无效文件')">🗑️ 清理无效文件</div>
             <div class="menu-item" onclick="sendMsg('查找所有关于美食的资料')">🍲 美食相关资料</div>
+            <div class="menu-item" onclick="listFiles()">📂 查看我的文件</div> <!-- 添加查看文件按钮 -->
         </div>
 
         <!-- 中间：核心对话区域（仿豆包） -->
@@ -52,6 +53,7 @@
             <div class="shortcut" onclick="sendMsg('保存：我爱吃清蒸鱼，不吃辣和香菜')">添加饮食偏好</div>
             <div class="shortcut" onclick="sendMsg('查找我上传的所有PDF文件')">查找PDF文件</div>
             <div class="shortcut" onclick="sendMsg('帮我整理今天的日记')">整理日记</div>
+            <div class="shortcut" onclick="listFiles()">查看我的文件</div> <!-- 添加查看文件快捷指令 -->
         </div>
     </div>
 
@@ -81,6 +83,50 @@
             }
         }
 
+        // 获取文件列表
+        async function listFiles() {
+            try {
+                const res = await fetch('/list_files', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        user_id: 'user_001',
+                        page: 1,
+                        page_size: 20
+                    })
+                });
+                
+                if (!res.ok) {
+                    throw new Error(`HTTP错误！状态码：${res.status}`);
+                }
+                
+                const data = await res.json();
+                if (data.code === 200) {
+                    if (data.data.files.length === 0) {
+                        addMsg('ai', '📂 你还没有上传任何文件');
+                        return;
+                    }
+                    
+                    let filesMsg = '📂 你的文件列表：<br>';
+                    data.data.files.forEach(file => {
+                        filesMsg += `<div style="margin: 5px 0; padding: 5px; background: #f0f0f0; border-radius: 4px;">
+                            <a href="/download_file/${file.file_id}" target="_blank" style="color: #1890ff; text-decoration: none;">
+                                <i class="fas fa-file-download"></i> ${file.filename}
+                            </a><br>
+                            <small style="color: #666;">上传时间：${new Date(file.create_time).toLocaleString()}</small>
+                        </div>`;
+                    });
+                    
+                    addMsg('ai', filesMsg);
+                } else {
+                    addMsg('ai', `❌ 获取文件列表失败：${data.msg}`);
+                }
+            } catch (e) {
+                addMsg('ai', `❌ 获取文件列表失败：${e.message}`);
+                console.error('获取文件列表错误:', e);
+            }
+        }
+
         // 发送消息核心函数
         async function sendMsg(customMsg = '') {
             const msgInput = document.getElementById('msg-input');
@@ -96,7 +142,7 @@
             sendBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 发送中...';
 
             // 添加用户消息到页面
-            addMsg('user', content);
+            addMsg('user', content + (files.length > 0 ? ` (上传了 ${files.length} 个文件)` : ''));
             msgInput.value = '';
             fileInput.value = '';
 
@@ -121,8 +167,19 @@
                     }
                     
                     data = await res.json();
-                    // /save_all接口返回的是msg字段
+                    
+                    // 显示成功消息
                     addMsg('ai', data.msg);
+                    
+                    // 如果上传了文件，显示文件列表
+                    if (data.data && data.data.files && data.data.files.length > 0) {
+                        let filesMsg = '✅ 已上传文件：<br>';
+                        data.data.files.forEach(filename => {
+                            filesMsg += `- ${filename}<br>`;
+                        });
+                        filesMsg += '<br>📌 你可以点击左侧"查看我的文件"来下载这些文件';
+                        addMsg('ai', filesMsg);
+                    }
                 } else {
                     // 只有文字内容时，调用/chat接口
                     res = await fetch('/chat', {

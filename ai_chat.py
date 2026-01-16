@@ -11,6 +11,7 @@ from dashscope import Generation
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables.base import Runnable
 import os
+import re
 from main import col_chat_history, col_user_memory
 
 # 猴子补丁：解决 langchain_core.pydantic_v1 模块缺失问题
@@ -24,7 +25,10 @@ class MockPydanticV1:
 sys.modules['langchain_core.pydantic_v1'] = MockPydanticV1()
 
 # 导入全局应用实例
-from main import app, col_file_meta, client
+from main import app, col_file_meta, client, fs
+
+# 导入文件操作相关函数
+from file_operations import save_everything, list_files, download_file
 
 # 加载环境变量
 api_key = os.getenv("DASHSCOPE_API_KEY")
@@ -48,254 +52,178 @@ class CustomEntityMemory:
         
         # 实体存储
         self.entity_store = type('EntityStore', (), {
-            'store': {}  # 存储实体信息的字典
+            'store': {},
+            'get': lambda self, key: self.store.get(key),
+            'set': lambda self, key, value: self.store.__setitem__(key, value),
+            'delete': lambda self, key: self.store.__delitem__(key),
+            'keys': lambda self: self.store.keys(),
+            'values': lambda self: self.store.values(),
+            'items': lambda self: self.store.items(),
+            'clear': lambda self: self.store.clear()
         })()
         
-        # 历史对话存储
-        self.history = []
+        # 对话历史
+        self.chat_history = []
         
-        # 对话缓冲区
-        self.buffer = []
+        # 实体提取器
+        self.entity_extractor = type('EntityExtractor', (), {
+            'extract_entities': lambda self, text: []
+        })()
+        
+        # 实体记忆的键
+        self.memory_key = "entities"
+        
+        # 输入键
+        self.input_key = "input"
+        
+        # 输出键
+        self.output_key = "output"
+    
+    def add_memory(self, input_text, output_text):
+        """添加记忆到实体存储"""
+        # 将输入输出对保存到对话历史
+        self.chat_history.append(f"{self.human_prefix}: {input_text}")
+        self.chat_history.append(f"{self.ai_prefix}: {output_text}")
+        
+        # 模拟实体提取
+        entities = self._extract_entities_from_text(input_text + " " + output_text)
+        
+        # 更新实体存储
+        for entity, description in entities.items():
+            self.entity_store.set(entity, description)
+        
+        # 限制实体存储大小
+        if len(self.entity_store.store) > self.entity_cache_limit:
+            # 移除最早添加的实体
+            oldest_entity = next(iter(self.entity_store.keys()))
+            self.entity_store.delete(oldest_entity)
+    
+    def _extract_entities_from_text(self, text):
+        """从文本中提取实体（简单实现）"""
+        entities = {}
+        
+        # 简单的实体提取逻辑：寻找以大写字母开头的单词序列
+        words = text.split()
+        i = 0
+        while i < len(words):
+            if words[i].istitle():
+                # 可能是一个实体的开始
+                entity = [words[i]]
+                i += 1
+                while i < len(words) and (words[i].istitle() or words[i].isupper()):
+                    entity.append(words[i])
+                    i += 1
+                entity_name = " ".join(entity)
+                if entity_name in text:
+                    # 查找实体描述
+                    start_idx = text.find(entity_name) + len(entity_name)
+                    end_idx = text.find(".", start_idx)
+                    if end_idx == -1:
+                        end_idx = text.find("。", start_idx)
+                    if end_idx == -1:
+                        end_idx = len(text)
+                    description = text[start_idx:end_idx].strip()
+                    if description:
+                        entities[entity_name] = description
+            else:
+                i += 1
+        
+        return entities
     
     def load_memory_variables(self, inputs):
         """加载记忆变量"""
-        # 获取历史对话
-        history = self.get_history_string()
-        
-        # 获取实体信息
-        entities = json.dumps(self.entity_store.store, ensure_ascii=False)
-        
         return {
-            "history": history,
-            "entities": entities
+            self.memory_key: dict(self.entity_store.items()),
+            "chat_history": self.chat_history
         }
     
     def save_context(self, inputs, outputs):
-        """保存对话上下文"""
-        input_text = inputs.get("input", "")
-        output_text = outputs.get("output", "")
-        
-        # 保存到历史
-        self.history.append({
-            "user": input_text,
-            "ai": output_text
-        })
-        
-        # 限制历史长度
-        if len(self.history) > 100:
-            self.history = self.history[-100:]
-        
-        # 更新实体存储
-        self._update_entity_store(input_text, output_text)
+        """保存上下文到记忆"""
+        input_text = inputs.get(self.input_key, "")
+        output_text = outputs.get(self.output_key, "")
+        self.add_memory(input_text, output_text)
     
-    def get_history_string(self):
-        """获取格式化的历史对话字符串"""
-        history_str = ""
-        for entry in self.history:
-            history_str += f"{self.human_prefix}: {entry['user']}\n{self.ai_prefix}: {entry['ai']}\n"
-        return history_str.strip()
-    
-    def _update_entity_store(self, input_text, output_text):
-        """更新实体存储"""
-        # 简单的实体提取逻辑（实际应用中可以使用更复杂的NLP技术）
-        combined_text = input_text + " " + output_text
-        
-        # 提取可能的实体（简单示例：提取以"我喜欢"开头的实体）
-        if "我喜欢" in combined_text:
-            start_idx = combined_text.find("我喜欢") + 3
-            # 提取到下一个标点符号或句子结束
-            end_idx = start_idx
-            while end_idx < len(combined_text) and combined_text[end_idx] not in [",", ".", "。", "，", "!", "！", "?", "？", "\n"]:
-                end_idx += 1
-            if end_idx > start_idx:
-                entity = combined_text[start_idx:end_idx].strip()
-                if entity:
-                    self.entity_store.store[entity] = "用户喜欢的事物"
-        
-        # 限制实体存储数量
-        if len(self.entity_store.store) > self.entity_cache_limit:
-            # 移除最早添加的实体
-            old_entity = next(iter(self.entity_store.store))
-            del self.entity_store.store[old_entity]
+    def clear(self):
+        """清除记忆"""
+        self.entity_store.clear()
+        self.chat_history = []
 
-# -------------------------- 自定义LLM类（使用原生dashscope） --------------------------
-class DashScopeLLM(Runnable):
-    def __init__(self, model="qwen-turbo", temperature=0.7, api_key=None):
-        self.model = model
-        self.temperature = temperature
-        self.api_key = api_key
-        
-        # 设置dashscope API密钥
-        if api_key:
-            dashscope.api_key = api_key
-    
-    def invoke(self, input, config=None, **kwargs):
-        """同步调用dashscope API"""
-        try:
-            # 确保输入是字符串
-            if isinstance(input, dict):
-                input = input.get("prompt", "")
-            
-            # 调用dashscope API
-            response = Generation.call(
-                model=self.model,
-                prompt=input,
-                temperature=self.temperature
-            )
-            
-            # 处理响应
-            if response.status_code == 200 and response.output and response.output.text:
-                return {"content": response.output.text}
-            else:
-                raise Exception(f"DashScope API调用失败: {response}")
-        except Exception as e:
-            print(f"同步调用失败: {e}")
-            traceback.print_exc()
-            raise
-    
-    async def ainvoke(self, input, config=None, **kwargs):
-        """异步调用dashscope API"""
-        try:
-            # 确保输入是字符串
-            if isinstance(input, dict):
-                input = input.get("prompt", "")
-            
-            # 使用asyncio.to_thread执行同步调用
-            response = await asyncio.to_thread(
-                Generation.call,
-                model=self.model,
-                prompt=input,
-                temperature=self.temperature
-            )
-            
-            # 处理响应
-            if response.status_code == 200 and response.output and response.output.text:
-                return {"content": response.output.text}
-            else:
-                raise Exception(f"DashScope API异步调用失败: {response}")
-        except Exception as e:
-            print(f"异步调用失败: {e}")
-            traceback.print_exc()
-            raise
+# 创建自定义实体记忆实例
+entity_memory = CustomEntityMemory(entity_cache_limit=100)
 
-# 创建通义千问( DashScope )实例
-llm = DashScopeLLM(
-    model="qwen-turbo",  # 可以根据需要更换为其他千问模型
-    temperature=0.7,
-    api_key=api_key
-)
-
-print("成功创建通义千问(DashScopeLLM)实例")
-
-# 使用自定义实体记忆替代ConversationEntityMemory
-entity_memory = CustomEntityMemory(
-    entity_cache_limit=100,
-    human_prefix="用户",
-    ai_prefix="AI助理"
-)
-
+# -------------------------- 豆包风格提示词 --------------------------
 MEMORY_PROMPT = PromptTemplate(
-    input_variables=["input", "history", "entities"],
-    template="""你是用户的专属AI纳界助理，拥有用户的全部长期记忆和知识库，风格和豆包一致，回复简洁精准友好。
-    1. 你需要严格记住用户的实体信息：{entities}（比如爱吃鱼、不吃辣、忌口、喜好等，所有对话必须关联该记忆）
-    2. 参考历史对话上下文：{history}
-    3. 针对用户的问题/指令：{input} 进行精准回复，支持自然语言操控所有功能。
-    规则：用户的所有资料永久保存，可随时调取；自动整理无效文件；提取关键记忆并永久生效；上传的文件自动解析内容并保存。
-    回复要求：口语化、流畅，和豆包的回复风格一致，不要生硬，记忆内容无缝融入回复中。
-    """
+    input_variables=["input", "entities", "chat_history"],
+    template="""你是一个知识渊博、友好的AI助手，名叫"可心"。
+请使用中文回答用户问题，保持自然、流畅的对话风格。
+你应该：
+1. 基于用户提供的信息和你的知识回答问题
+2. 使用用户易于理解的语言
+3. 保持对话的连贯性，参考之前的对话历史
+4. 对于不确定的问题，诚实地表示不知道
+5. 对于文件操作请求，请返回相应的指令格式
+
+已知实体信息：
+{entities}
+
+对话历史：
+{chat_history}
+
+用户输入：
+{input}
+
+AI回复："""
 )
 
-# 创建一个简单的runnable，模拟原来的ConversationChain行为
-class SimpleRunnable:
+# -------------------------- 简单的Runnable实现 --------------------------
+class SimpleRunnable(Runnable):
+    """简单的Runnable实现，用于处理对话"""
+    
     def __init__(self, entity_memory, prompt, llm):
         self.entity_memory = entity_memory
         self.prompt = prompt
         self.llm = llm
     
-    def invoke(self, input, config=None, **kwargs):
-        try:
-            # 获取历史对话
-            history = self.entity_memory.load_memory_variables({})["history"]
-            # 获取实体信息
-            entities = self.entity_memory.load_memory_variables({})["entities"]
-            
-            # 格式化提示
-            formatted_prompt = self.prompt.format(
-                input=input["input"],
-                history=history,
-                entities=entities
-            )
-            
-            print(f"[同步] 准备调用LLM，提示词长度: {len(formatted_prompt)}")
-            # 使用LLM生成回复
-            response = self.llm.invoke(formatted_prompt)
-            print(f"[同步] LLM调用成功，响应类型: {type(response)}")
-            
-            # 处理不同的返回格式
-            if hasattr(response, 'content'):
-                response_content = response.content
-            elif isinstance(response, dict) and 'content' in response:
-                response_content = response['content']
-            else:
-                response_content = str(response)
-            
-            print(f"[同步] LLM回复内容: {response_content}")
-            
-            # 更新记忆
-            self.entity_memory.save_context(
-                {"input": input["input"]},
-                {"output": response_content}
-            )
-            
-            print(f"[同步] 记忆更新成功，返回AI回复")
-            return {"output": response_content}
-        except Exception as e:
-            print(f"[同步] invoke方法执行失败: {e}")
-            traceback.print_exc()
-            return {"output": "抱歉，我暂时无法处理您的请求，请稍后重试。"}
+    def invoke(self, input_data, config=None, **kwargs):
+        """同步调用"""
+        # 使用asyncio.run来运行异步代码
+        return asyncio.run(self.ainvoke(input_data, config, **kwargs))
     
-    async def ainvoke(self, input, config=None, **kwargs):
-        try:
-            # 获取历史对话
-            history = self.entity_memory.load_memory_variables({})["history"]
-            # 获取实体信息
-            entities = self.entity_memory.load_memory_variables({})["entities"]
-            
-            # 格式化提示
-            formatted_prompt = self.prompt.format(
-                input=input["input"],
-                history=history,
-                entities=entities
-            )
-            
-            print(f"[异步] 准备调用LLM，提示词长度: {len(formatted_prompt)}")
-            
-            # 异步调用LLM
-            response = await self.llm.ainvoke(formatted_prompt)
-            print(f"[异步] LLM异步调用成功，响应类型: {type(response)}")
-            
-            # 处理不同的返回格式
-            if hasattr(response, 'content'):
-                response_content = response.content
-            elif isinstance(response, dict) and 'content' in response:
-                response_content = response['content']
-            else:
-                response_content = str(response)
-            
-            print(f"[异步] LLM回复内容: {response_content}")
-            
-            # 更新记忆
-            self.entity_memory.save_context(
-                {"input": input["input"]},
-                {"output": response_content}
-            )
-            
-            print(f"[异步] 记忆更新成功，返回AI回复")
-            return {"output": response_content}
-        except Exception as e:
-            print(f"[异步] ainvoke方法执行失败: {e}")
-            traceback.print_exc()
-            return {"output": "抱歉，我暂时无法处理您的请求，请稍后重试。"}
+    async def ainvoke(self, input_data, config=None, **kwargs):
+        """异步调用"""
+        # 加载记忆
+        memory_vars = self.entity_memory.load_memory_variables(input_data)
+        
+        # 格式化对话历史
+        chat_history_str = "\n".join(memory_vars.get("chat_history", [])) if memory_vars.get("chat_history", []) else "无"
+        
+        # 格式化提示词
+        prompt_text = self.prompt.format(
+            input=input_data.get("input", ""),
+            entities=json.dumps(memory_vars.get("entities", {}), ensure_ascii=False),
+            chat_history=chat_history_str
+        )
+        
+        # 调用大模型
+        response = Generation.call(
+            model="qwen-plus",
+            prompt=prompt_text,
+            result_format="message"
+        )
+        
+        # 获取回复
+        output = response.output.choices[0].message.content
+        
+        # 保存上下文到记忆
+        self.entity_memory.save_context(
+            input_data,
+            {"output": output}
+        )
+        
+        return {"output": output}
+
+# 初始化大模型
+llm = None  # 这里不需要实际的LLM实例，因为我们在SimpleRunnable中直接调用API
 
 # 创建简单的runnable实例
 runnable = SimpleRunnable(
@@ -328,6 +256,171 @@ async def chat_with_assistant(request: Request):
         
         print(f"收到用户消息: {message}")
         
+        # 指令解析：识别文件操作请求
+        lower_message = message.lower()
+        
+        # 1. 保存文件/内容指令
+        if any(keyword in lower_message for keyword in ["保存", "上传", "存储"]):
+            if "文件" in lower_message:
+                return JSONResponse(status_code=200, content={
+                    "code": 200, 
+                    "user_msg": message,
+                    "ai_reply": "请将要传的文件拖拽到上传指定区域",
+                    "your_key_memory": entity_memory.entity_store.store,
+                    "create_time": str(create_time)
+                })
+            else:
+                # 保存文本内容
+                try:
+                    # 调用save_everything函数保存文本
+                    result = await save_everything(content=message, files=[])
+                    return JSONResponse(status_code=200, content={
+                        "code": 200,
+                        "user_msg": message,
+                        "ai_reply": f"内容已保存成功！{result['msg']}",
+                        "your_key_memory": entity_memory.entity_store.store,
+                        "create_time": str(create_time)
+                    })
+                except Exception as e:
+                    print(f"保存内容失败: {e}")
+                    return JSONResponse(status_code=500, content={
+                        "code": 500, 
+                        "user_msg": message,
+                        "ai_reply": f"保存内容失败: {str(e)}",
+                        "your_key_memory": entity_memory.entity_store.store,
+                        "create_time": str(create_time)
+                    })
+        
+        # 2. 列出文件指令（支持按类型过滤）
+        elif any(keyword in lower_message for keyword in ["列出文件", "文件列表", "查看文件"]):
+            try:
+                # 检查是否需要按类型过滤
+                file_type = None
+                if "pdf" in lower_message:
+                    file_type = "pdf"
+                elif "excel" in lower_message or "xlsx" in lower_message or "xls" in lower_message:
+                    file_type = "xlsx"
+                elif "word" in lower_message or "docx" in lower_message or "doc" in lower_message:
+                    file_type = "docx"
+                elif "txt" in lower_message:
+                    file_type = "txt"
+                elif "image" in lower_message or "jpg" in lower_message or "png" in lower_message:
+                    file_type = "jpg"
+                
+                # 调用list_files函数获取文件列表
+                result = await list_files(user_id=user_id, page=1, page_size=10, file_type=file_type)
+                files = result["data"]["files"]
+                
+                if files:
+                    file_list = "\n".join([f"- {file['filename']} (ID: {file['file_id']})" for file in files])
+                    type_desc = f" {file_type.upper()}" if file_type else ""
+                    ai_reply = f"您上传的{type_desc}文件列表：\n{file_list}\n\n如果需要下载特定文件，请使用'下载文件 [文件ID]'指令。"
+                else:
+                    type_desc = f" {file_type.upper()}" if file_type else ""
+                    ai_reply = f"当前没有保存的{type_desc}文件。"
+                
+                return JSONResponse(status_code=200, content={
+                    "code": 200,
+                    "user_msg": message,
+                    "ai_reply": ai_reply,
+                    "your_key_memory": entity_memory.entity_store.store,
+                    "create_time": str(create_time)
+                })
+            except Exception as e:
+                print(f"获取文件列表失败: {e}")
+                return JSONResponse(status_code=500, content={
+                    "code": 500, 
+                    "user_msg": message,
+                    "ai_reply": f"获取文件列表失败: {str(e)}",
+                    "your_key_memory": entity_memory.entity_store.store,
+                    "create_time": str(create_time)
+                })
+        
+        # 3. 下载文件指令
+        elif "下载文件" in lower_message:
+            # 提取文件ID
+            match = re.search(r'下载文件\s+([a-zA-Z0-9]+)', lower_message)
+            if match:
+                file_id = match.group(1)
+                return JSONResponse(status_code=200, content={
+                    "code": 200,
+                    "user_msg": message,
+                    "ai_reply": f"请使用/download_file/{file_id}接口下载文件。",
+                    "your_key_memory": entity_memory.entity_store.store,
+                    "create_time": str(create_time)
+                })
+            else:
+                return JSONResponse(status_code=200, content={
+                    "code": 200,
+                    "user_msg": message,
+                    "ai_reply": "请提供正确的文件ID，格式：'下载文件 [文件ID]'",
+                    "your_key_memory": entity_memory.entity_store.store,
+                    "create_time": str(create_time)
+                })
+        
+        # 4. 查找/搜索文件指令
+        elif any(keyword in lower_message for keyword in ["查找", "搜索", "找出"]):
+            try:
+                # 提取文件类型
+                file_type = None
+                if "pdf" in lower_message:
+                    file_type = "pdf"
+                elif "excel" in lower_message or "xlsx" in lower_message or "xls" in lower_message:
+                    file_type = "xlsx"
+                elif "word" in lower_message or "docx" in lower_message or "doc" in lower_message:
+                    file_type = "docx"
+                elif "txt" in lower_message:
+                    file_type = "txt"
+                elif "image" in lower_message or "jpg" in lower_message or "png" in lower_message:
+                    file_type = "jpg"
+                
+                if not file_type:
+                    return JSONResponse(status_code=200, content={
+                        "code": 200,
+                        "user_msg": message,
+                        "ai_reply": "请明确您要查找的文件类型，例如：查找我上传的所有PDF文件",
+                        "your_key_memory": entity_memory.entity_store.store,
+                        "create_time": str(create_time)
+                    })
+                
+                # 调用list_files函数获取文件列表
+                result = await list_files(user_id=user_id, page=1, page_size=10, file_type=file_type)
+                files = result["data"]["files"]
+                
+                if files:
+                    file_list = "\n".join([f"- {file['filename']} (ID: {file['file_id']})" for file in files])
+                    ai_reply = f"找到您上传的{file_type.upper()}文件：\n{file_list}\n\n如果需要下载特定文件，请使用'下载文件 [文件ID]'指令。"
+                else:
+                    ai_reply = f"没有找到您上传的{file_type.upper()}文件。"
+                
+                return JSONResponse(status_code=200, content={
+                    "code": 200,
+                    "user_msg": message,
+                    "ai_reply": ai_reply,
+                    "your_key_memory": entity_memory.entity_store.store,
+                    "create_time": str(create_time)
+                })
+            except Exception as e:
+                print(f"查找文件失败: {e}")
+                return JSONResponse(status_code=500, content={
+                    "code": 500, 
+                    "user_msg": message,
+                    "ai_reply": f"查找文件失败: {str(e)}",
+                    "your_key_memory": entity_memory.entity_store.store,
+                    "create_time": str(create_time)
+                })
+        
+        # 5. 其他文件操作指令
+        elif any(keyword in lower_message for keyword in ["文件", "保存", "下载", "上传"]):
+            ai_reply = "我支持以下文件操作：\n1. 保存文本内容：直接输入要保存的内容即可\n2. 上传文件：请使用/save_all接口\n3. 列出文件：输入'列出文件'或'查看文件'\n4. 按类型查找文件：例如'查找我上传的所有PDF文件'\n5. 下载文件：输入'下载文件 [文件ID]'"
+            return JSONResponse(status_code=200, content={
+                "code": 200,
+                "user_msg": message,
+                "ai_reply": ai_reply,
+                "your_key_memory": entity_memory.entity_store.store,
+                "create_time": str(create_time)
+            })
+        
         # 核心：LangChain对话+记忆更新，豆包风格回复
         print("准备调用conversation_chain.ainvoke")
         result = await conversation_chain.ainvoke(
@@ -337,73 +430,100 @@ async def chat_with_assistant(request: Request):
         
         print(f"AI回复: {ai_reply}")
         
-        return {
+        return JSONResponse(status_code=200, content={
             "code": 200,
             "user_msg": message,
             "ai_reply": ai_reply,
             "your_key_memory": entity_memory.entity_store.store,
             "create_time": str(create_time)
-        }
+        })
     except json.JSONDecodeError as e:
         print(f"请求格式错误: {e}")
-        return JSONResponse(status_code=400, content={"code": 400, "msg": "请求格式错误，请使用JSON格式"})
+        return JSONResponse(status_code=400, content={
+            "code": 400, 
+            "user_msg": message,
+            "ai_reply": "请求格式错误，请使用JSON格式",
+            "your_key_memory": entity_memory.entity_store.store,
+            "create_time": str(create_time)
+        })
     except Exception as e:
         print(f"聊天失败: {e}")
         traceback.print_exc()
         # 提供更详细的错误信息，但注意不要泄露敏感信息
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"聊天失败: {str(e).split('(')[0]}"})
+        error_msg = f"聊天失败: {str(e).split('(')[0]}" if "(" in str(e) else str(e)
+        return JSONResponse(status_code=500, content={
+            "code": 500, 
+            "user_msg": message,
+            "ai_reply": error_msg,
+            "your_key_memory": entity_memory.entity_store.store,
+            "create_time": str(create_time)
+        })
 
 @app.post("/load_memory", summary="重启服务后加载长期记忆：保证记忆永不丢失")
 async def load_user_memory():
     user_id = "user_001"
     try:
         # 加载用户的长期记忆
-        user_memory = col_user_memory.find_one({"user_id": user_id})
-        if user_memory and "memory" in user_memory:
-            entity_memory.entity_store.store = user_memory["memory"]
-            return {"code": 200, "msg": "长期记忆加载成功", "memory": user_memory["memory"]}
-        return {"code": 200, "msg": "暂无长期记忆", "memory": {}}
+        memory_data = col_user_memory.find_one({"user_id": user_id})
+        if memory_data:
+            # 恢复实体存储
+            entity_memory.entity_store.store = memory_data.get("entities", {})
+            return JSONResponse(status_code=200, content={"code": 200, "msg": "长期记忆加载成功"})
+        else:
+            return JSONResponse(status_code=200, content={"code": 200, "msg": "没有找到长期记忆"})
     except Exception as e:
-        print(f"加载记忆失败: {e}")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"加载记忆失败: {str(e)}"})
+        print(f"加载长期记忆失败: {e}")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"加载长期记忆失败: {str(e).split('(')[0]}"})
 
-@app.post("/search", summary="深度检索：自然语言搜索所有保存的资料/聊天记录/记忆")
-async def search_all(
-    query: str = Body(..., description="搜索关键词/自然语言查询"),
-    search_type: str = Body(default="all", description="搜索类型：all(全部)/file(文件)/chat(聊天记录)/memory(记忆)")
-):
+@app.post("/save_memory", summary="手动保存当前实体记忆到数据库")
+async def save_memory():
     user_id = "user_001"
     try:
-        results = []
+        # 保存当前实体记忆到数据库
+        col_user_memory.update_one(
+            {"user_id": user_id},
+            {"$set": {"entities": entity_memory.entity_store.store, "update_time": datetime.datetime.now()}},
+            upsert=True
+        )
+        return JSONResponse(status_code=200, content={"code": 200, "msg": "实体记忆保存成功"})
+    except Exception as e:
+        print(f"保存实体记忆失败: {e}")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"保存实体记忆失败: {str(e).split('(')[0]}"})
+
+@app.post("/search", summary="搜索文件元信息+聊天记录+记忆：知识检索功能")
+async def search_knowledge(request: Request):
+    user_id = "user_001"
+    try:
+        # 手动解析请求体
+        request_body = await request.json()
+        query = request_body.get("query", "").strip()
+        
+        if not query:
+            return JSONResponse(status_code=400, content={"code": 400, "msg": "搜索关键词不能为空"})
+        
+        print(f"收到搜索请求: {query}")
         
         # 搜索文件元信息
-        if search_type in ["all", "file"]:
-            file_results = list(col_file_meta.find({"user_id": user_id, "is_valid": True}))
-            for doc in file_results:
-                if query in str(doc.get("content", "")) or query in doc.get("filename", ""):
-                    results.append({
-                        "type": "file",
-                        "filename": doc.get("filename", ""),
-                        "content": doc.get("content", "")[:200] + "..." if len(doc.get("content", "")) > 200 else doc.get("content", ""),
-                        "create_time": str(doc.get("create_time", ""))
-                    })
+        files = list(col_file_meta.find(
+            {"user_id": user_id, "is_valid": True},
+            {"_id": 0, "file_id": 1, "filename": 1, "content": 1, "create_time": 1}
+        ))
         
-        # 搜索聊天记录
-        if search_type in ["all", "chat"]:
-            # 这里可以根据需要实现聊天记录搜索
-            pass
+        # 简单的文本匹配
+        search_results = []
+        for file in files:
+            if query in file.get("filename", "") or query in file.get("content", ""):
+                search_results.append(file)
         
-        # 搜索记忆
-        if search_type in ["all", "memory"]:
-            for entity, description in entity_memory.entity_store.store.items():
-                if query in entity or query in description:
-                    results.append({
-                        "type": "memory",
-                        "entity": entity,
-                        "description": description
-                    })
-        
-        return {"code": 200, "msg": "搜索完成", "results": results}
+        return JSONResponse(status_code=200, content={
+            "code": 200,
+            "query": query,
+            "results": search_results,
+            "count": len(search_results)
+        })
+    except json.JSONDecodeError as e:
+        print(f"请求格式错误: {e}")
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "请求格式错误，请使用JSON格式"})
     except Exception as e:
         print(f"搜索失败: {e}")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"搜索失败: {str(e)}"})
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"搜索失败: {str(e).split('(')[0]}"})
