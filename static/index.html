@@ -63,9 +63,22 @@
 
         // 加载记忆接口
         async function loadMemory() {
-            const res = await fetch('/load_memory', { method: 'POST', headers: {'Content-Type': 'application/json'}});
-            const data = await res.json();
-            addMsg('ai', data.msg);
+            try {
+                const res = await fetch('/load_memory', { 
+                    method: 'POST', 
+                    headers: {'Content-Type': 'application/json'}
+                });
+                
+                if (!res.ok) {
+                    throw new Error(`HTTP错误！状态码：${res.status}`);
+                }
+                
+                const data = await res.json();
+                addMsg('ai', data.msg);
+            } catch (e) {
+                addMsg('ai', `❌ 加载记忆失败：${e.message}`);
+                console.error('加载记忆错误:', e);
+            }
         }
 
         // 发送消息核心函数
@@ -74,8 +87,13 @@
             const content = customMsg || msgInput.value.trim();
             const fileInput = document.getElementById('file-input');
             const files = fileInput.files;
+            const sendBtn = document.getElementById('send-btn');
 
             if (!content && files.length === 0) return;
+
+            // 禁用发送按钮，显示加载状态
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 发送中...';
 
             // 添加用户消息到页面
             addMsg('user', content);
@@ -97,6 +115,11 @@
                         method: 'POST',
                         body: formData
                     });
+                    
+                    if (!res.ok) {
+                        throw new Error(`HTTP错误！状态码：${res.status}`);
+                    }
+                    
                     data = await res.json();
                     // /save_all接口返回的是msg字段
                     addMsg('ai', data.msg);
@@ -107,6 +130,11 @@
                         body: JSON.stringify({message: content}),
                         headers: {'Content-Type': 'application/json'}
                     });
+                    
+                    if (!res.ok) {
+                        throw new Error(`HTTP错误！状态码：${res.status}`);
+                    }
+                    
                     data = await res.json();
                     // /chat接口返回的是ai_reply字段
                     addMsg('ai', data.ai_reply);
@@ -120,8 +148,18 @@
                     }
                 }
             } catch (e) {
-                addMsg('ai', '❌ 网络错误，请重试！');
+                let errorMsg = '❌ 网络错误，请重试！';
+                if (e.message.includes('Failed to fetch')) {
+                    errorMsg = '❌ 无法连接到服务器，请检查后端服务是否正常运行';
+                } else if (e.message.includes('HTTP错误')) {
+                    errorMsg = `❌ 服务器错误：${e.message}`;
+                }
+                addMsg('ai', errorMsg);
                 console.error('网络请求错误:', e);
+            } finally {
+                // 恢复发送按钮
+                sendBtn.disabled = false;
+                sendBtn.innerHTML = '发送';
             }
         }
 

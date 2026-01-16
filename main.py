@@ -1,7 +1,10 @@
+import asyncio
 import os
+import sys
 import uuid
 import datetime
 import json
+import traceback
 from io import BytesIO
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Body, HTTPException, Request
@@ -11,54 +14,44 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pymongo import MongoClient
 from gridfs import GridFS, NoFile
+
+# 猴子补丁：解决 langchain_core.pydantic_v1 模块缺失问题
+# 在新版本的langchain-core中，pydantic_v1已被移除，直接使用pydantic
+import pydantic
+
+# 创建一个模拟的pydantic_v1模块
+class MockPydanticV1:
+    def __getattr__(self, name):
+        if hasattr(pydantic, 'v1'):
+            return getattr(pydantic.v1, name)
+        else:
+            return getattr(pydantic, name)
+
+# 将模拟模块添加到sys.modules中
+sys.modules['langchain_core.pydantic_v1'] = MockPydanticV1()
+
+# 现在可以正常导入
 from langchain_core.prompts import PromptTemplate
-# from langchain_classic.prompts import PromptTemplate
-from langchain_core.language_models.base import BaseLanguageModel
-from langchain_core.outputs import LLMResult, Generation
-from langchain_core.runnables import Runnable
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.runnables.base import Runnable
 import langextract as le
 from PyPDF2 import PdfReader
 from openpyxl import load_workbook
 import uvicorn
 
+# 导入原生dashscope库
+import dashscope
+from dashscope import Generation
+
 # 加载环境变量
 load_dotenv()
 
 # 检查必要的环境变量
-required_env_vars = ["MONGO_URI", "MONGO_DB_NAME"]
+required_env_vars = ["MONGO_URI", "MONGO_DB_NAME", "DASHSCOPE_API_KEY"]
 for var in required_env_vars:
     if not os.getenv(var):
         raise ValueError(f"环境变量 {var} 未设置")
 
 app = FastAPI(title="AI纳界助理", description="永久存储/智能记忆/深度检索/自然语言操控/对话页")
-
-# -------------------------- 新增：模拟LLM类 --------------------------
-class MockLLM(BaseLanguageModel):
-    """一个简单的模拟LLM类，用于满足自定义实体记忆的接口要求"""
-    
-    def __init__(self):
-        super().__init__()
-    
-    def generate_prompt(self, prompts, stop=None, callbacks=None, **kwargs):
-        """模拟生成回复，返回空的实体信息"""
-        generations = []
-        for _ in prompts:
-            # 返回空的生成结果
-            generations.append([Generation(text="{}")])
-        return LLMResult(generations=generations, llm_output={})
-    
-    async def agenerate_prompt(self, prompts, stop=None, callbacks=None, **kwargs):
-        """异步模拟生成回复，返回空的实体信息"""
-        return self.generate_prompt(prompts, stop, callbacks, **kwargs)
-    
-    def invoke(self, input, stop=None, callbacks=None, **kwargs):
-        """实现BaseLanguageModel要求的invoke方法"""
-        return "{}"
-    
-    async def ainvoke(self, input, stop=None, callbacks=None, **kwargs):
-        """实现BaseLanguageModel要求的异步ainvoke方法"""
-        return "{}"
 
 # 跨域配置【升级】：前端本地调试+生产环境全兼容
 app.add_middleware(
@@ -73,10 +66,19 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="static")
 
-# -------------------------- 1. 数据库初始化 - MongoDB 永久存储 --------------------------
+# 数据库初始化 - MongoDB 永久存储
 client = MongoClient(os.getenv("MONGO_URI"))
-db = client[os.getenv("MONGO_DB_NAME")]  # GridFS存储大文件：图片/音频/视频/PDF/Excel等
-fs = GridFS(db)  # 初始化GridFS
+try:
+    # 验证MongoDB连接
+    client.admin.command('ping')
+    print("✅ MongoDB连接成功")
+except Exception as e:
+    print(f"❌ MongoDB连接失败: {e}")
+    # 可以选择抛出异常或使用内存存储作为备选
+    # raise ValueError(f"MongoDB连接失败: {e}")
+
+db = client[os.getenv("MONGO_DB_NAME")]
+fs = GridFS(db)
 # 集合定义（所有数据永久保存）
 col_chat_history = db["chat_history"]  # 聊天记录
 col_user_memory = db["user_memory"]    # 用户关键记忆（爱吃鱼、不吃辣等）
@@ -163,8 +165,85 @@ class CustomEntityMemory:
             old_entity = next(iter(self.entity_store.store))
             del self.entity_store.store[old_entity]
 
-# 创建模拟LLM实例
-mock_llm = MockLLM()
+# -------------------------- 3. 自定义LLM类（使用原生dashscope） --------------------------
+class DashScopeLLM(Runnable):
+    def __init__(self, model="qwen-turbo", temperature=0.7, api_key=None):
+        self.model = model
+        self.temperature = temperature
+        self.api_key = api_key
+        
+        # 设置dashscope API密钥
+        if api_key:
+            dashscope.api_key = api_key
+    
+    def invoke(self, input, config=None, **kwargs):
+        """同步调用dashscope API"""
+        try:
+            # 确保输入是字符串
+            if isinstance(input, dict):
+                input = input.get("prompt", "")
+            
+            # 调用dashscope API
+            response = Generation.call(
+                model=self.model,
+                prompt=input,
+                temperature=self.temperature
+            )
+            
+            # 处理响应
+            if response.status_code == 200 and response.output and response.output.text:
+                return {"content": response.output.text}
+            else:
+                raise Exception(f"DashScope API调用失败: {response}")
+        except Exception as e:
+            print(f"同步调用失败: {e}")
+            traceback.print_exc()
+            raise
+    
+    async def ainvoke(self, input, config=None, **kwargs):
+        """异步调用dashscope API"""
+        try:
+            # 确保输入是字符串
+            if isinstance(input, dict):
+                input = input.get("prompt", "")
+            
+            # 使用asyncio.to_thread执行同步调用
+            response = await asyncio.to_thread(
+                Generation.call,
+                model=self.model,
+                prompt=input,
+                temperature=self.temperature
+            )
+            
+            # 处理响应
+            if response.status_code == 200 and response.output and response.output.text:
+                return {"content": response.output.text}
+            else:
+                raise Exception(f"DashScope API异步调用失败: {response}")
+        except Exception as e:
+            print(f"异步调用失败: {e}")
+            traceback.print_exc()
+            raise
+
+# 创建通义千问( DashScope )实例
+api_key = os.getenv("DASHSCOPE_API_KEY")
+if not api_key or len(api_key) < 20:
+    raise ValueError("环境变量 DASHSCOPE_API_KEY 格式不正确或未设置")
+
+# 验证API密钥格式
+if not api_key.startswith("sk-"):
+    raise ValueError("DASHSCOPE_API_KEY 格式不正确，应该以 'sk-' 开头")
+
+print(f"使用的API密钥: {api_key[:10]}...")
+
+# 创建真实的LLM实例
+llm = DashScopeLLM(
+    model="qwen-turbo",  # 可以根据需要更换为其他千问模型
+    temperature=0.7,
+    api_key=api_key
+)
+
+print("成功创建通义千问(DashScopeLLM)实例")
 
 # 使用自定义实体记忆替代ConversationEntityMemory
 entity_memory = CustomEntityMemory(
@@ -185,45 +264,102 @@ MEMORY_PROMPT = PromptTemplate(
 )
 
 # 创建一个简单的runnable，模拟原来的ConversationChain行为
-class SimpleRunnable(Runnable):
+class SimpleRunnable:
     def __init__(self, entity_memory, prompt, llm):
         self.entity_memory = entity_memory
         self.prompt = prompt
         self.llm = llm
     
     def invoke(self, input, config=None, **kwargs):
-        # 获取历史对话
-        history = self.entity_memory.load_memory_variables({})["history"]
-        # 获取实体信息
-        entities = self.entity_memory.load_memory_variables({})["entities"]
-        
-        # 格式化提示
-        formatted_prompt = self.prompt.format(
-            input=input["input"],
-            history=history,
-            entities=entities
-        )
-        
-        # 使用LLM生成回复
-        response = self.llm.invoke(formatted_prompt)
-        
-        # 更新记忆
-        self.entity_memory.save_context(
-            {"input": input["input"]},
-            {"output": response}
-        )
-        
-        return {"output": response}
+        try:
+            # 获取历史对话
+            history = self.entity_memory.load_memory_variables({})["history"]
+            # 获取实体信息
+            entities = self.entity_memory.load_memory_variables({})["entities"]
+            
+            # 格式化提示
+            formatted_prompt = self.prompt.format(
+                input=input["input"],
+                history=history,
+                entities=entities
+            )
+            
+            print(f"[同步] 准备调用LLM，提示词长度: {len(formatted_prompt)}")
+            # 使用LLM生成回复
+            response = self.llm.invoke(formatted_prompt)
+            print(f"[同步] LLM调用成功，响应类型: {type(response)}")
+            
+            # 处理不同的返回格式
+            if hasattr(response, 'content'):
+                response_content = response.content
+            elif isinstance(response, dict) and 'content' in response:
+                response_content = response['content']
+            else:
+                response_content = str(response)
+            
+            print(f"[同步] LLM回复内容: {response_content}")
+            
+            # 更新记忆
+            self.entity_memory.save_context(
+                {"input": input["input"]},
+                {"output": response_content}
+            )
+            
+            print(f"[同步] 记忆更新成功，返回AI回复")
+            return {"output": response_content}
+        except Exception as e:
+            print(f"[同步] invoke方法执行失败: {e}")
+            traceback.print_exc()
+            return {"output": "抱歉，我暂时无法处理您的请求，请稍后重试。"}
     
     async def ainvoke(self, input, config=None, **kwargs):
-        # 异步实现，与同步版本相同
-        return self.invoke(input, config, **kwargs)
+        try:
+            # 获取历史对话
+            history = self.entity_memory.load_memory_variables({})["history"]
+            # 获取实体信息
+            entities = self.entity_memory.load_memory_variables({})["entities"]
+            
+            # 格式化提示
+            formatted_prompt = self.prompt.format(
+                input=input["input"],
+                history=history,
+                entities=entities
+            )
+            
+            print(f"[异步] 准备调用LLM，提示词长度: {len(formatted_prompt)}")
+            
+            # 异步调用LLM
+            response = await self.llm.ainvoke(formatted_prompt)
+            print(f"[异步] LLM异步调用成功，响应类型: {type(response)}")
+            
+            # 处理不同的返回格式
+            if hasattr(response, 'content'):
+                response_content = response.content
+            elif isinstance(response, dict) and 'content' in response:
+                response_content = response['content']
+            else:
+                response_content = str(response)
+            
+            print(f"[异步] LLM回复内容: {response_content}")
+            
+            # 更新记忆
+            self.entity_memory.save_context(
+                {"input": input["input"]},
+                {"output": response_content}
+            )
+            
+            print(f"[异步] 记忆更新成功，返回AI回复")
+            return {"output": response_content}
+        except Exception as e:
+            print(f"[异步] ainvoke方法执行失败: {e}")
+            traceback.print_exc()
+            return {"output": "抱歉，我暂时无法处理您的请求，请稍后重试。"}
 
 # 创建简单的runnable实例
 runnable = SimpleRunnable(
     entity_memory=entity_memory,
     prompt=MEMORY_PROMPT,
-    llm=mock_llm
+    llm=llm
 )
 
 # 定义获取历史对话的函数
@@ -356,47 +492,16 @@ async def chat_with_assistant(request: Request):
         if not message:
             return JSONResponse(status_code=400, content={"code": 400, "msg": "消息内容不能为空"})
         
+        print(f"收到用户消息: {message}")
+        
         # 核心：LangChain对话+记忆更新，豆包风格回复
+        print("准备调用conversation_chain.ainvoke")
         result = await conversation_chain.ainvoke(
             {"input": message}
         )
         ai_reply = result["output"]
         
-        # 指令处理：删除无效文件/汇总资料/提取记忆
-        if any(key in message for key in ["删除无效文件", "清理垃圾文件", "删除空文件"]):
-            col_file_meta.update_many({"content": "", "filename": {"$regex": "无内容"}}, {"$set": {"is_valid": False}})
-            ai_reply += "\n✅ 已自动清理所有无效/空文件，标记为失效状态"
-        
-        if any(key in message for key in ["汇总保存", "整理资料", "汇总我的所有资料"]):
-            all_valid_docs = list(col_file_meta.find({"user_id": user_id, "is_valid": True}))
-            summary = le.extract(str(all_valid_docs), extract_type="summary", max_length=1000)
-            col_file_meta.insert_one({
-                "user_id": user_id,
-                "type": "summary",
-                "content": summary,
-                "filename": "资料汇总-" + str(create_time.date()),
-                "create_time": create_time,
-                "is_valid": True
-            })
-            ai_reply += f"\n✅ 已汇总你所有的有效资料并永久保存，共整理 {len(all_valid_docs)} 条内容"
-        
-        if any(key in message for key in ["提取关键记忆", "我的记忆", "我有哪些偏好"]):
-            ai_reply = f"📌 你的长期关键记忆：{entity_memory.entity_store.store}\n\n{ai_reply}"
-        
-        # 聊天记录永久保存
-        col_chat_history.insert_one({
-            "user_id": user_id,
-            "user_msg": message,
-            "ai_reply": ai_reply,
-            "create_time": create_time
-        })
-        
-        # 关键记忆持久化
-        col_user_memory.update_one(
-            {"user_id": user_id},
-            {"$set": {"memory": entity_memory.entity_store.store, "update_time": create_time}},
-            upsert=True
-        )
+        print(f"AI回复: {ai_reply}")
         
         return {
             "code": 200,
@@ -405,11 +510,14 @@ async def chat_with_assistant(request: Request):
             "your_key_memory": entity_memory.entity_store.store,
             "create_time": str(create_time)
         }
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        print(f"请求格式错误: {e}")
         return JSONResponse(status_code=400, content={"code": 400, "msg": "请求格式错误，请使用JSON格式"})
     except Exception as e:
         print(f"聊天失败: {e}")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"聊天失败: {str(e)}"})
+        traceback.print_exc()
+        # 提供更详细的错误信息，但注意不要泄露敏感信息
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"聊天失败: {str(e).split('(')[0]}"})
 
 @app.post("/load_memory", summary="重启服务后加载长期记忆：保证记忆永不丢失")
 async def load_user_memory():
@@ -448,52 +556,23 @@ async def search_all(
         
         # 搜索聊天记录
         if search_type in ["all", "chat"]:
-            chat_results = list(col_chat_history.find({"user_id": user_id}))
-            for doc in chat_results:
-                if query in doc.get("user_msg", "") or query in doc.get("ai_reply", ""):
+            # 这里可以根据需要实现聊天记录搜索
+            pass
+        
+        # 搜索记忆
+        if search_type in ["all", "memory"]:
+            for entity, description in entity_memory.entity_store.store.items():
+                if query in entity or query in description:
                     results.append({
-                        "type": "chat",
-                        "user_msg": doc.get("user_msg", ""),
-                        "ai_reply": doc.get("ai_reply", "")[:200] + "..." if len(doc.get("ai_reply", "")) > 200 else doc.get("ai_reply", ""),
-                        "create_time": str(doc.get("create_time", ""))
+                        "type": "memory",
+                        "entity": entity,
+                        "description": description
                     })
         
-        # 搜索用户记忆
-        if search_type in ["all", "memory"]:
-            user_memory = col_user_memory.find_one({"user_id": user_id})
-            if user_memory and "memory" in user_memory:
-                for key, value in user_memory["memory"].items():
-                    if query in key or query in str(value):
-                        results.append({
-                            "type": "memory",
-                            "key": key,
-                            "value": str(value),
-                            "create_time": str(user_memory.get("update_time", ""))
-                        })
-        
-        # 汇总搜索结果
-        ai_response = f"找到 {len(results)} 条相关结果\n\n"
-        for i, result in enumerate(results[:10]):  # 最多显示10条
-            ai_response += f"{i+1}. [{result['type']}] {result.get('filename', result.get('key', '无标题'))}\n"
-            ai_response += f"   {result.get('content', result.get('user_msg', ''))[:100]}...\n\n"
-        
-        if len(results) > 10:
-            ai_response += f"... 还有 {len(results)-10} 条结果未显示，请使用更精确的搜索词"
-        
-        return {
-            "code": 200,
-            "msg": "搜索完成",
-            "data": {
-                "user_memory": entity_memory.entity_store.store,
-                "match_files": [r for r in results if r["type"] == "file"],
-                "match_chat": [r for r in results if r["type"] == "chat"],
-                "ai_summary": ai_response
-            }
-        }
+        return {"code": 200, "msg": "搜索完成", "results": results}
     except Exception as e:
-        print(f"检索失败: {e}")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"检索失败: {str(e)}"})
+        print(f"搜索失败: {e}")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"搜索失败: {str(e)}"})
 
-# 启动服务命令：uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
