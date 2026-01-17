@@ -10,7 +10,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from PyPDF2 import PdfReader
 from openpyxl import load_workbook
 from gridfs import NoFile
-
+from bson import ObjectId  # 添加ObjectId导入
+import urllib.parse  # 导入urllib.parse用于文件名编码
 # 导入全局应用实例和数据库集合
 from main import app, col_file_meta, fs
 
@@ -181,25 +182,34 @@ async def save_everything(
 @app.get("/download_file/{file_id}", summary="下载文件接口：根据文件ID下载文件")
 async def download_file(file_id: str = Path(..., description="文件ID，从file_id字段获取")):
     try:
+        # 转换为ObjectId类型进行数据库查询
+        obj_id = ObjectId(file_id)
+        
         # 查找文件元信息
-        file_meta = col_file_meta.find_one({"file_id": file_id})
+        file_meta = col_file_meta.find_one({"file_id": obj_id})
         if not file_meta:
             raise HTTPException(status_code=404, detail="文件不存在")
         
         # 从GridFS获取文件
-        grid_out = fs.get(file_id)
+        grid_out = fs.get(obj_id)
         filename = grid_out.filename
         
-        # 返回文件流
+        # 对包含中文字符的文件名进行URL编码，解决UnicodeEncodeError
+        encoded_filename = urllib.parse.quote(filename)
+        
+        # 返回文件流，使用正确的Content-Disposition格式
         return StreamingResponse(
             grid_out,
             media_type=grid_out.content_type or "application/octet-stream",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+            }
         )
     except NoFile:
         raise HTTPException(status_code=404, detail="文件不存在")
     except Exception as e:
         print(f"下载文件失败: {e}")
+        print(traceback.format_exc())  # 打印完整的错误堆栈信息
         return JSONResponse(status_code=500, content={"code": 500, "msg": f"下载文件失败: {str(e)}"})
 
 @app.post("/list_files", summary="获取文件列表接口：列出所有已保存的文件，支持按类型过滤")

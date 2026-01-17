@@ -12,6 +12,8 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables.base import Runnable
 import os
 import re
+from bson import ObjectId  # 添加这一行
+from gridfs import NoFile  # 添加这一行
 from main import col_chat_history, col_user_memory
 
 # 猴子补丁：解决 langchain_core.pydantic_v1 模块缺失问题
@@ -349,21 +351,50 @@ async def chat_with_assistant(request: Request):
         
         # 3. 下载文件指令
         elif "下载文件" in lower_message:
-            # 提取文件ID
-            match = re.search(r'下载文件\s*\[?([a-zA-Z0-9]+)\]?', lower_message)
+            # 提取文件ID，匹配完整的MongoDB ObjectId格式（24个十六进制字符）
+            match = re.search(r'下载文件\s+([a-fA-F0-9]{24})', lower_message)
             if match:
                 file_id = match.group(1)
-                ai_reply = f"请使用/download_file/{file_id}接口下载文件。"
-                await save_chat_history(user_id, message, ai_reply, create_time)
-                return JSONResponse(status_code=200, content={
-                    "code": 200,
-                    "user_msg": message,
-                    "ai_reply": ai_reply,
-                    "your_key_memory": entity_memory.entity_store.store,
-                    "create_time": str(create_time)
-                })
+                try:
+                    # 转换为ObjectId类型
+                    object_id = ObjectId(file_id)
+                    
+                    # 验证文件是否存在
+                    file_meta = col_file_meta.find_one({"file_id": object_id})
+                    
+                    if file_meta:
+                        # 生成包含正确下载链接的回复，确保前端能触发自动下载
+                        ai_reply = f"/download_file/{file_id} 已开始下载文件：{file_meta.get('filename', '未命名文件')}"
+                        await save_chat_history(user_id, message, ai_reply, create_time)
+                        return JSONResponse(status_code=200, content={
+                            "code": 200,
+                            "user_msg": message,
+                            "ai_reply": ai_reply,
+                            "your_key_memory": entity_memory.entity_store.store,
+                            "create_time": str(create_time)
+                        })
+                    else:
+                        ai_reply = f"❌ 文件ID不存在，请检查ID是否正确"
+                        await save_chat_history(user_id, message, ai_reply, create_time)
+                        return JSONResponse(status_code=200, content={
+                            "code": 200,
+                            "user_msg": message,
+                            "ai_reply": ai_reply,
+                            "your_key_memory": entity_memory.entity_store.store,
+                            "create_time": str(create_time)
+                        })
+                except Exception as e:
+                    ai_reply = f"❌ 处理文件ID时出错：{str(e)}"
+                    await save_chat_history(user_id, message, ai_reply, create_time)
+                    return JSONResponse(status_code=200, content={
+                        "code": 200,
+                        "user_msg": message,
+                        "ai_reply": ai_reply,
+                        "your_key_memory": entity_memory.entity_store.store,
+                        "create_time": str(create_time)
+                    })
             else:
-                ai_reply = "请提供正确的文件ID，格式：'下载文件 [文件ID]'"
+                ai_reply = "请提供正确的文件ID，格式：'下载文件 [24位十六进制文件ID]'"
                 await save_chat_history(user_id, message, ai_reply, create_time)
                 return JSONResponse(status_code=200, content={
                     "code": 200,

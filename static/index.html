@@ -275,6 +275,51 @@
             chatContent.appendChild(msgDiv);
             // 滚动到底部
             chatContent.scrollTop = chatContent.scrollHeight;
+            
+            // 自动下载功能：如果是AI回复且包含下载链接，自动触发下载
+            if (type === 'ai' && content.includes('/download_file/')) {
+                // 提取下载链接，匹配完整的ObjectId格式
+                const downloadUrl = content.match(/\/download_file\/[a-fA-F0-9]{24}/)[0];
+                
+                // 使用fetch API获取文件，确保能获取到正确的文件名
+                fetch(downloadUrl)
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error('Network response was not ok');
+                        }
+                        
+                        // 从响应头中提取文件名
+                        const contentDisposition = response.headers.get('Content-Disposition');
+                        let filename = 'downloaded_file';
+                        
+                        if (contentDisposition) {
+                            const match = contentDisposition.match(/filename="?([^"]+)"?/);
+                            if (match && match[1]) {
+                                filename = match[1];
+                            }
+                        }
+                        
+                        // 获取文件内容
+                        return response.blob().then(blob => ({ blob, filename }));
+                    })
+                    .then(({ blob, filename }) => {
+                        // 创建blob URL并触发下载
+                        const url = window.URL.createObjectURL(blob);
+                        const link = document.createElement('a');
+                        link.href = url;
+                        link.download = filename; // 使用从响应头获取的文件名
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                        
+                        // 释放blob URL
+                        window.URL.revokeObjectURL(url);
+                    })
+                    .catch(error => {
+                        console.error('下载文件出错:', error);
+                        addMsg('ai', '❌ 下载文件失败，请重试');
+                    });
+            }
         }
 
         // 回车发送消息
