@@ -38,7 +38,8 @@ async def extract_file_content(file: UploadFile, file_content: bytes):
         elif ".docx" in filename:
             content = f"[{file.filename}] Word文档，已保存"
         elif ".xlsx" in filename:
-            workbook = load_workbook(filename=BytesIO(file_content))
+            # 修复这里的参数问题
+            workbook = load_workbook(BytesIO(file_content))
             sheet = workbook.active
             for row in sheet.iter_rows(values_only=True):
                 if any(cell for cell in row):
@@ -73,14 +74,10 @@ def generate_summary(text: str, max_length: int = 500) -> str:
         print(f"摘要生成异常: {e}")
         return text[:max_length]
 
-# -------------------------- 文件操作API接口 --------------------------
-@app.post("/save_all", summary="核心接口：发送任意内容/文件给AI，永久保存+自动整理")
-async def save_everything(
-    content: str = Form(default=""),
-    files: Optional[List[UploadFile]] = File(None)
-):
+# -------------------------- 核心逻辑辅助函数 --------------------------
+async def _save_everything(content: str, files: Optional[List[UploadFile]] = None):
     """
-    保存文本内容和文件到MongoDB
+    保存文本内容和文件到MongoDB的核心逻辑
     """
     try:
         user_id = "user_001"
@@ -107,7 +104,7 @@ async def save_everything(
                 })
             except Exception as e:
                 print(f"保存文本内容失败: {e}")
-                return JSONResponse(status_code=500, content={"code": 500, "msg": f"保存文本内容失败: {str(e)}"})
+                return {"code": 500, "msg": f"保存文本内容失败: {str(e)}"}
         
         # 处理上传的文件
         file_list = []
@@ -146,7 +143,7 @@ async def save_everything(
             except Exception as e:
                 print(f"处理文件 {file.filename} 失败: {e}")
                 print(traceback.format_exc())
-                return JSONResponse(status_code=500, content={"code": 500, "msg": f"处理文件 {file.filename} 失败: {str(e)}"})
+                return {"code": 500, "msg": f"处理文件 {file.filename} 失败: {str(e)}"}
         
         # 返回成功响应
         response_data = {
@@ -164,7 +161,22 @@ async def save_everything(
     except Exception as e:
         print(f"保存内容失败: {e}")
         print(traceback.format_exc())
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"服务器内部错误: {str(e)}"})
+        return {"code": 500, "msg": f"服务器内部错误: {str(e)}"}
+
+# -------------------------- 文件操作API接口 --------------------------
+@app.post("/save_all", summary="核心接口：发送任意内容/文件给AI，永久保存+自动整理")
+async def save_everything(
+    content: str = Form(default=""),
+    files: Optional[List[UploadFile]] = File(None)
+):
+    """
+    保存文本内容和文件到MongoDB
+    """
+    result = await _save_everything(content, files)
+    if result["code"] == 200:
+        return result
+    else:
+        return JSONResponse(status_code=result["code"], content=result)
 
 @app.get("/download_file/{file_id}", summary="下载文件接口：根据文件ID下载文件")
 async def download_file(file_id: str = Path(..., description="文件ID，从file_id字段获取")):

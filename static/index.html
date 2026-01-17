@@ -185,7 +185,7 @@
             // 添加用户消息到页面
             addMsg('user', content + (files.length > 0 ? ` (上传了 ${files.length} 个文件)` : ''));
             msgInput.value = '';
-            fileInput.value = '';
+            // 不要在这里清空fileInput.value，因为这会影响files引用
 
             // 调用后端接口
             try {
@@ -258,6 +258,8 @@
                 // 恢复发送按钮
                 sendBtn.disabled = false;
                 sendBtn.innerHTML = '发送';
+                // 在finally块中清空文件输入框，确保无论成功还是失败都会清空
+                fileInput.value = '';
             }
         }
 

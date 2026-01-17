@@ -67,7 +67,5 @@ if __name__ == "__main__":
         "main:app", 
         host="0.0.0.0", 
         port=8000, 
-        reload=True,
-        # 使用正确的uvicorn参数设置请求体大小限制（100MB）
-        max_request_size=100 * 1024 * 1024  # 100MB
+        reload=True
     )

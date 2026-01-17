@@ -28,7 +28,7 @@ sys.modules['langchain_core.pydantic_v1'] = MockPydanticV1()
 from main import app, col_file_meta, client, fs
 
 # 导入文件操作相关函数
-from file_operations import save_everything, list_files, download_file
+from file_operations import _save_everything, list_files, download_file
 
 # 加载环境变量
 api_key = os.getenv("DASHSCOPE_API_KEY")
@@ -277,7 +277,7 @@ async def chat_with_assistant(request: Request):
                 # 保存文本内容
                 try:
                     # 调用save_everything函数保存文本
-                    result = await save_everything(content=message, files=[])
+                    result = await _save_everything(content=message)
                     ai_reply = f"内容已保存成功！{result['msg']}"
                     await save_chat_history(user_id, message, ai_reply, create_time)
                     return JSONResponse(status_code=200, content={
