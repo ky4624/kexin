@@ -350,7 +350,7 @@ async def chat_with_assistant(request: Request):
         # 3. 下载文件指令
         elif "下载文件" in lower_message:
             # 提取文件ID
-            match = re.search(r'下载文件\s+([a-zA-Z0-9]+)', lower_message)
+            match = re.search(r'下载文件\s*\[?([a-zA-Z0-9]+)\]?', lower_message)
             if match:
                 file_id = match.group(1)
                 ai_reply = f"请使用/download_file/{file_id}接口下载文件。"
