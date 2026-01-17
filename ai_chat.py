@@ -264,7 +264,7 @@ async def chat_with_assistant(request: Request):
         # 1. 保存文件/内容指令
         if any(keyword in lower_message for keyword in ["保存", "上传", "存储"]):
             if "文件" in lower_message:
-                ai_reply = "请将要传的文件拖拽到上传指定区域"
+                ai_reply = "请将要传的文件拖拽到输入框"
                 await save_chat_history(user_id, message, ai_reply, create_time)
                 return JSONResponse(status_code=200, content={
                     "code": 200, 

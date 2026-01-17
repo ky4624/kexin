@@ -3,8 +3,9 @@ import uuid
 import datetime
 import traceback
 import os
+from typing import Optional, List
 from io import BytesIO
-from fastapi import Body, File, HTTPException, UploadFile, Path
+from fastapi import Body, File, HTTPException, UploadFile, Path, Form
 from fastapi.responses import JSONResponse, StreamingResponse
 from PyPDF2 import PdfReader
 from openpyxl import load_workbook
@@ -18,41 +19,33 @@ from dashscope import Generation
 
 # -------------------------- 文件操作工具函数 --------------------------
 async def extract_file_content(file: UploadFile, file_content: bytes):
-    """智能提取各类文件内容（升级后）：图片OCR/音频转文字/PDF/Word/Excel/TXT/视频帧等"""
+    """智能提取各类文件内容"""
     content = ""
     try:
         filename = file.filename.lower()
         if any(ext in filename for ext in [".jpg", ".jpeg", ".png", ".bmp", ".gif"]):
-            # 图片：当前使用模拟内容（实际需接入OCR服务）
             content = f"[{file.filename}] 图片内容，已保存"
         elif any(ext in filename for ext in [".mp3", ".wav", ".m4a", ".ogg"]):
-            # 音频：当前使用模拟内容（实际需接入语音转文字服务）
             content = f"[{file.filename}] 音频内容，已保存"
         elif any(ext in filename for ext in [".mp4", ".avi", ".mov", ".wmv"]):
-            # 视频：当前使用模拟内容（实际需接入视频分析服务）
             content = f"[{file.filename}] 视频内容，已保存"
         elif ".pdf" in filename:
-            # PDF：使用PyPDF2提取文字
             pdf_reader = PdfReader(BytesIO(file_content))
             for page in pdf_reader.pages:
                 content += page.extract_text() or ""
             if not content.strip():
                 content = f"[{file.filename}] PDF文件，已保存，无文字内容"
         elif ".docx" in filename:
-            # Word：当前使用模拟内容（实际需接入python-docx库）
             content = f"[{file.filename}] Word文档，已保存"
         elif ".xlsx" in filename:
-            # Excel：使用openpyxl提取内容
             workbook = load_workbook(filename=BytesIO(file_content))
             sheet = workbook.active
             for row in sheet.iter_rows(values_only=True):
-                if any(cell for cell in row):  # 只处理非空行
+                if any(cell for cell in row):
                     content += "\t".join(str(cell) if cell is not None else "" for cell in row) + "\n"
         elif ".txt" in filename:
-            # TXT：直接读取
             content = file_content.decode("utf-8", errors="ignore")
         else:
-            # 其他格式：保存为二进制文件
             content = f"[{file.filename}] 已保存，不支持内容提取"
     except Exception as e:
         print(f"文件内容提取失败: {e}")
@@ -75,43 +68,68 @@ def generate_summary(text: str, max_length: int = 500) -> str:
             return response.output.choices[0].message.content.strip()
         else:
             print(f"摘要生成失败: {response}")
-            return text[:max_length]  # 失败时返回原文前max_length个字符
+            return text[:max_length]
     except Exception as e:
         print(f"摘要生成异常: {e}")
-        return text[:max_length]  # 异常时返回原文前max_length个字符
+        return text[:max_length]
 
 # -------------------------- 文件操作API接口 --------------------------
 @app.post("/save_all", summary="核心接口：发送任意内容/文件给AI，永久保存+自动整理")
 async def save_everything(
-    content: str = Body(default="", description="文本内容：日记/资料/文字信息"),
-    files: list[UploadFile] = File(default=[], description="上传文件：图片/音频/视频/PDF/Excel/所有格式")
+    content: str = Form(default=""),
+    files: Optional[List[UploadFile]] = File(None)
 ):
-    user_id = "user_001"
-    save_id = str(uuid.uuid4())
-    create_time = datetime.datetime.now()
-    
+    """
+    保存文本内容和文件到MongoDB
+    """
     try:
-        if content.strip():
-            # 使用dashscope生成摘要，替换之前的langextract.extract
-            core_content = generate_summary(content, max_length=500)
-            col_file_meta.insert_one({
-                "save_id": save_id,
-                "user_id": user_id,
-                "type": "text",
-                "content": content,
-                "core_content": core_content,
-                "filename": "文本笔记/日记",
-                "create_time": create_time,
-                "is_valid": True
-            })
+        user_id = "user_001"
+        save_id = str(uuid.uuid4())
+        create_time = datetime.datetime.now()
         
+        # 处理文件列表，确保files是一个列表
+        if files is None:
+            files = []
+        
+        # 处理文本内容
+        if content.strip():
+            try:
+                core_content = generate_summary(content, max_length=500)
+                col_file_meta.insert_one({
+                    "save_id": save_id,
+                    "user_id": user_id,
+                    "type": "text",
+                    "content": content,
+                    "core_content": core_content,
+                    "filename": "文本笔记/日记",
+                    "create_time": create_time,
+                    "is_valid": True
+                })
+            except Exception as e:
+                print(f"保存文本内容失败: {e}")
+                return JSONResponse(status_code=500, content={"code": 500, "msg": f"保存文本内容失败: {str(e)}"})
+        
+        # 处理上传的文件
         file_list = []
         for file in files:
             try:
-                # 只读取一次文件内容
+                print(f"处理文件: {file.filename}")
                 file_content = await file.read()
-                file_id = fs.put(file_content, filename=file.filename, content_type=file.content_type)
+                
+                # 保存文件到GridFS
+                file_id = fs.put(
+                    file_content, 
+                    filename=file.filename, 
+                    content_type=file.content_type,
+                    user_id=user_id,
+                    create_time=create_time
+                )
+                print(f"文件保存到GridFS成功，file_id: {file_id}")
+                
+                # 提取文件内容
                 extract_content = await extract_file_content(file, file_content)
+                
+                # 保存文件元信息到集合
                 col_file_meta.insert_one({
                     "save_id": save_id,
                     "user_id": user_id,
@@ -122,22 +140,31 @@ async def save_everything(
                     "create_time": create_time,
                     "is_valid": True
                 })
+                print(f"文件元信息保存成功")
+                
                 file_list.append(file.filename)
             except Exception as e:
                 print(f"处理文件 {file.filename} 失败: {e}")
+                print(traceback.format_exc())
                 return JSONResponse(status_code=500, content={"code": 500, "msg": f"处理文件 {file.filename} 失败: {str(e)}"})
         
-        # 不再直接调用conversation_chain，避免循环导入
-        # 更新记忆的功能可以通过其他方式实现，比如在聊天接口中处理
-        
-        return {
+        # 返回成功响应
+        response_data = {
             "code": 200,
             "msg": "✅ 所有内容已永久保存+AI自动整理完成",
-            "data": {"save_id": save_id, "create_time": str(create_time), "files": file_list}
+            "data": {
+                "save_id": save_id,
+                "create_time": str(create_time),
+                "files": file_list
+            }
         }
+        print(f"返回响应: {response_data}")
+        return response_data
+        
     except Exception as e:
         print(f"保存内容失败: {e}")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"保存内容失败: {str(e)}"})
+        print(traceback.format_exc())
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"服务器内部错误: {str(e)}"})
 
 @app.get("/download_file/{file_id}", summary="下载文件接口：根据文件ID下载文件")
 async def download_file(file_id: str = Path(..., description="文件ID，从file_id字段获取")):

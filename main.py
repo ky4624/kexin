@@ -2,7 +2,7 @@ import asyncio
 import os
 import sys
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -10,6 +10,7 @@ from fastapi.templating import Jinja2Templates
 from pymongo import MongoClient
 from gridfs import GridFS, NoFile
 import uvicorn
+from fastapi import Request, Depends, HTTPException, Form
 
 # 加载环境变量
 load_dotenv()
@@ -20,6 +21,7 @@ for var in required_env_vars:
     if not os.getenv(var):
         raise ValueError(f"环境变量 {var} 未设置")
 
+# 创建FastAPI应用实例，移除已弃用的请求体大小参数
 app = FastAPI(title="AI纳界助理", description="永久存储/智能记忆/深度检索/自然语言操控/对话页")
 
 # 跨域配置
@@ -61,4 +63,11 @@ async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=8000, 
+        reload=True,
+        # 使用正确的uvicorn参数设置请求体大小限制（100MB）
+        max_request_size=100 * 1024 * 1024  # 100MB
+    )

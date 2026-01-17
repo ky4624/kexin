@@ -37,24 +37,24 @@
                 </div>
             </div>
 
-            <!-- 底部：输入框（豆包同款） -->
-            <div class="input-area">
-                <label for="file-input" class="file-btn"><i class="fas fa-paperclip"></i></label>
-                <input type="file" id="file-input" multiple accept="*">
-                <textarea id="msg-input" placeholder="输入你的问题/指令/资料，支持自然语言操控，比如：我爱吃鱼不吃辣、保存这份日记、查找上周的PDF..." spellcheck="false"></textarea>
-                <button id="send-btn" onclick="sendMsg()">发送</button>
-            </div>
+        <!-- 底部：输入框（豆包同款） -->
+        <div class="input-area">
+            <label for="file-input" class="file-btn"><i class="fas fa-paperclip"></i></label>
+            <input type="file" id="file-input" multiple accept="*">
+            <textarea id="msg-input" placeholder="输入你的问题/指令/资料，支持自然语言操控，比如：我爱吃鱼不吃辣、保存这份日记、查找上周的PDF..." spellcheck="false"></textarea>
+            <label for="file-input" class="plus-btn"><i class="fas fa-plus"></i></label>
+            <button id="send-btn" onclick="sendMsg()">发送</button>
         </div>
 
         <!-- 右侧：快捷指令 -->
-        <div class="right-sidebar">
+        <!-- <div class="right-sidebar">
             <div class="title">⚡ 快捷指令</div>
             <div class="shortcut" onclick="sendMsg('今天适合吃什么？')">今天吃什么？</div>
             <div class="shortcut" onclick="sendMsg('保存：我爱吃清蒸鱼，不吃辣和香菜')">添加饮食偏好</div>
             <div class="shortcut" onclick="sendMsg('查找我上传的所有PDF文件')">查找PDF文件</div>
             <div class="shortcut" onclick="sendMsg('帮我整理今天的日记')">整理日记</div>
-            <div class="shortcut" onclick="listFiles()">查看我的文件</div> <!-- 添加查看文件快捷指令 -->
-        </div>
+            <div class="shortcut" onclick="listFiles()">查看我的文件</div> 
+        </div> -->
     </div>
 
     <script>
@@ -126,6 +126,47 @@
                 console.error('获取文件列表错误:', e);
             }
         }
+
+        // 添加文件拖放支持
+        const msgInput = document.getElementById('msg-input');
+        const fileInput = document.getElementById('file-input');
+
+        // 拖放事件处理
+        msgInput.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            msgInput.classList.add('drag-over');
+        });
+
+        msgInput.addEventListener('dragleave', () => {
+            msgInput.classList.remove('drag-over');
+        });
+
+        msgInput.addEventListener('drop', (e) => {
+            e.preventDefault();
+            msgInput.classList.remove('drag-over');
+            
+            if (e.dataTransfer.files.length > 0) {
+                // 设置拖放的文件到文件输入框
+                fileInput.files = e.dataTransfer.files;
+                // 显示已选择文件数量的提示
+                const fileCount = e.dataTransfer.files.length;
+                addMsg('ai', `📎 已选择 ${fileCount} 个文件，请点击发送按钮上传`);
+            }
+        });
+
+        // 为加号按钮添加文件选择事件
+        const plusBtn = document.querySelector('.plus-btn');
+        plusBtn.addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        // 监听文件选择事件
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length > 0) {
+                const fileCount = fileInput.files.length;
+                addMsg('ai', `📎 已选择 ${fileCount} 个文件，请点击发送按钮上传`);
+            }
+        });
 
         // 发送消息核心函数
         async function sendMsg(customMsg = '') {

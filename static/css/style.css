@@ -140,13 +140,16 @@ body {
     border-top: 1px solid #e5e7eb;
     background: #fff;
     display: flex;
-    align-items: flex-end;
+    align-items: center;
     gap: 12px;
 }
+
 #file-input {
     display: none;
 }
-.file-btn {
+
+.file-btn,
+.plus-btn {
     width: 36px;
     height: 36px;
     border-radius: 50%;
@@ -157,7 +160,15 @@ body {
     justify-content: center;
     cursor: pointer;
     border: none;
+    flex-shrink: 0;
+    transition: all 0.2s;
 }
+
+.plus-btn:hover {
+    background: #e6f0ff;
+    transform: scale(1.05);
+}
+
 #msg-input {
     flex: 1;
     border: 1px solid #e5e7eb;
@@ -168,10 +179,19 @@ body {
     max-height: 200px;
     font-size: 15px;
     outline: none;
+    transition: all 0.3s ease;
 }
+
 #msg-input:focus {
     border-color: #165DFF;
 }
+
+#msg-input.drag-over {
+    border-color: #1890ff;
+    background-color: rgba(24, 144, 255, 0.05);
+    box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2);
+}
+
 #send-btn {
     background: #165DFF;
     color: #fff;
@@ -180,7 +200,9 @@ body {
     padding: 10px 20px;
     cursor: pointer;
     font-size: 15px;
+    flex-shrink: 0;
 }
+
 #send-btn:hover {
     background: #0e4bdb;
 }
